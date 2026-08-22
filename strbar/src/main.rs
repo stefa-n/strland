@@ -164,7 +164,11 @@ struct DynamicIslandApp {
     display_volume: f32,
     volume_initialized: bool,
     volume_mode_deadline: Option<Instant>,
+    hold_shown_until: Option<Instant>,
     notification_mode_deadline: Option<Instant>,
+    notif: Option<win::NotificationInfo>,
+    notif_deadline: Option<Instant>,
+    notif_shown_at: Option<Instant>,
 
     media_playing: bool,
     visualizer_visibility: f32,
@@ -175,6 +179,7 @@ struct DynamicIslandApp {
     vol_icon_on: Option<egui::TextureHandle>,
     vol_icon_off: Option<egui::TextureHandle>,
     status_icon_wifi: Option<egui::TextureHandle>,
+    status_icon_eth: Option<egui::TextureHandle>,
     status_icon_bt: Option<egui::TextureHandle>,
     status_icon_battery: Option<egui::TextureHandle>,
     search_icon: Option<egui::TextureHandle>,
@@ -250,7 +255,11 @@ impl DynamicIslandApp {
             display_volume: 0.0,
             volume_initialized: false,
             volume_mode_deadline: None,
+            hold_shown_until: None,
             notification_mode_deadline: None,
+            notif: None,
+            notif_deadline: None,
+            notif_shown_at: None,
             media_playing: false,
             visualizer_visibility: 0.0,
             display_bands: [0.0; 4],
@@ -258,6 +267,7 @@ impl DynamicIslandApp {
             vol_icon_on: None,
             vol_icon_off: None,
             status_icon_wifi: None,
+            status_icon_eth: None,
             status_icon_bt: None,
             status_icon_battery: None,
             search_icon: None,
@@ -295,10 +305,15 @@ impl DynamicIslandApp {
             let phys_w = desired.x * scale;
             let phys_h = desired.y * scale;
             let x = ((win::get_screen_width() as f32 - phys_w) / 2.0).round() as i32;
-            // The switcher overlay is vertically centered on screen.
+            // The switcher overlay is vertically centered on screen; as it
+            // closes it eases back up to the island's resting position instead
+            // of teleporting.
             let y = if self.switcher.active || self.switcher.anim > 0.001 {
                 let screen_h = win::get_screen_height();
-                ((screen_h as f32 - phys_h) / 2.0).round() as i32
+                let centered = (screen_h as f32 - phys_h) / 2.0;
+                // anim=1 → centered; anim→0 → current_y (top of screen).
+                let t = ease_out_cubic(self.switcher.anim);
+                lerp(centered, self.current_y, 1.0 - t).round() as i32
             } else {
                 self.current_y.round() as i32
             };
@@ -399,6 +414,9 @@ impl DynamicIslandApp {
             self.volume_mode_deadline =
                 Some(now + Duration::from_millis(self.cfg.volume_timeout_ms));
             self.last_volume = win::get_volume();
+            self.bring_down_if_hidden();
+            self.hold_shown_until =
+                Some(now + Duration::from_millis(self.cfg.volume_timeout_ms + 1000));
         }
 
         let vol = win::get_volume();
@@ -416,6 +434,9 @@ impl DynamicIslandApp {
             self.width_animating = true;
             self.volume_mode_deadline =
                 Some(now + Duration::from_millis(self.cfg.volume_timeout_ms));
+            self.bring_down_if_hidden();
+            self.hold_shown_until =
+                Some(now + Duration::from_millis(self.cfg.volume_timeout_ms + 1000));
         } else if self.mode == IslandMode::Volume {
             if let Some(deadline) = self.volume_mode_deadline {
                 if now >= deadline {
@@ -486,6 +507,15 @@ impl DynamicIslandApp {
         }
     }
 
+    /// Slides the island back down (un-hides) if it's currently hidden.
+    fn bring_down_if_hidden(&mut self) {
+        if self.hidden {
+            self.hidden = false;
+            self.target_y = self.cfg.y_padding;
+            self.y_animating = true;
+        }
+    }
+
     fn update_window_styles(&mut self, clickthrough: bool, accepts_focus: bool) {
         if self.clickthrough == clickthrough && self.accepts_focus == accepts_focus {
             return;
@@ -514,6 +544,9 @@ impl DynamicIslandApp {
         // Status icons (accent-tinted at draw time).
         self.status_icon_wifi.get_or_insert_with(|| {
             render_svg_texture(ctx, "status-wifi", WIFI_SVG, icon_px)
+        });
+        self.status_icon_eth.get_or_insert_with(|| {
+            render_svg_texture(ctx, "status-eth", ETHERNET_SVG, icon_px)
         });
         self.status_icon_bt.get_or_insert_with(|| {
             render_svg_texture(ctx, "status-bt", BLUETOOTH_SVG, icon_px)
@@ -587,7 +620,13 @@ impl eframe::App for DynamicIslandApp {
         let cursor = win::frame_cursor();
 
         if now >= self.polls.next_window {
-            self.poll_window_state(&cursor);
+            // Don't auto-hide while a notification card is up, or while the
+            // island is pinned down after a volume change — it should stay
+            // visible for its timeout instead of jittering up and down.
+            let holding = self.hold_shown_until.map(|t| now < t).unwrap_or(false);
+            if self.notif.is_none() && !holding {
+                self.poll_window_state(&cursor);
+            }
             self.polls.next_window = now + Duration::from_millis(self.cfg.window_poll_ms);
         }
         if now >= self.polls.next_volume {
@@ -598,9 +637,31 @@ impl eframe::App for DynamicIslandApp {
         // Media playing is polled on a background thread — just read the atomic
         self.media_playing = win::media_is_playing();
 
-        // Song change → brief "Now Playing" notification (suppressed in Peace
-        // / Do-Not-Disturb mode).
-        if self.mode == IslandMode::Clock
+        // New Windows toast notification → show it as a card and bring the
+        // island back down (suppressed in Peace / Do-Not-Disturb mode). Only
+        // apps with a custom implementation are shown (currently Discord).
+        if !self.control_state.dnd && win::take_new_notification(1200) {
+            let found = win::take_latest_notification()
+                .filter(|n| is_supported_notification_app(&n.app));
+            if let Some(n) = found {
+                self.notif = Some(n);
+                self.notif_shown_at = Some(now);
+                self.notif_deadline =
+                    Some(now + Duration::from_millis(self.cfg.notification_timeout_ms));
+                self.mode = IslandMode::Notification;
+                // Slide the island back down if it's hidden.
+                if self.hidden {
+                    self.hidden = false;
+                    self.target_y = self.cfg.y_padding;
+                    self.y_animating = true;
+                }
+            }
+        }
+
+        // Song change → brief "Now Playing" notification (only if nothing else
+        // is showing; suppressed in Peace).
+        if self.notif.is_none()
+            && self.mode == IslandMode::Clock
             && self.media_playing
             && !self.control_state.dnd
             && win::take_track_change(400)
@@ -609,7 +670,8 @@ impl eframe::App for DynamicIslandApp {
             self.notification_mode_deadline =
                 Some(now + Duration::from_millis(self.cfg.notification_timeout_ms));
         }
-        // Notification timeout → back to the clock.
+
+        // Auto-dismiss timeout.
         if let Some(deadline) = self.notification_mode_deadline {
             if now >= deadline {
                 self.notification_mode_deadline = None;
@@ -618,12 +680,41 @@ impl eframe::App for DynamicIslandApp {
                 }
             }
         }
+        if let Some(deadline) = self.notif_deadline {
+            if now >= deadline {
+                self.notif_deadline = None;
+                self.notif = None;
+                self.notif_shown_at = None;
+                if self.mode == IslandMode::Notification {
+                    self.mode = IslandMode::Clock;
+                }
+            }
+        }
+        // Click or global ESC dismisses the notification card. A short grace
+        // after appearing prevents an in-flight click from dismissing it the
+        // instant it pops up.
+        if self.notif.is_some() {
+            let clicking = ctx.input(|i| i.pointer.any_pressed())
+                && self.notif_shown_at.map(|t| now.duration_since(t) > Duration::from_millis(150)).unwrap_or(false);
+            let esc = win::take_escape(100);
+            if clicking || esc {
+                self.notif = None;
+                self.notif_deadline = None;
+                self.notif_shown_at = None;
+                if self.mode == IslandMode::Notification {
+                    self.mode = IslandMode::Clock;
+                }
+            }
+        }
 
-        // Clicking outside the launcher (focus lost to another window) returns
-        // to clock mode.
+        // Close the launcher if it genuinely loses focus to another window —
+        // but only after it has actually held focus (otherwise opening via Win
+        // key while foreground-locked would instantly bounce back to clock).
         if self.launcher.open {
             if let Some(hwnd) = self.hwnd {
-                if win::foreground_hwnd() != hwnd {
+                if win::foreground_hwnd() == hwnd {
+                    self.had_panel_focus = true;
+                } else if self.had_panel_focus {
                     self.set_launcher_open(ctx, false);
                 }
             }
@@ -692,7 +783,7 @@ impl eframe::App for DynamicIslandApp {
                     self.control_state.submenu = modes::ControlSubmenu::None;
                 }
             }
-        } else {
+        } else if !self.launcher.open && !self.switcher.active {
             self.had_panel_focus = false;
         }
 
@@ -718,27 +809,30 @@ impl eframe::App for DynamicIslandApp {
 
         // --- Alt+Tab app switcher lifecycle ---
         if win::switcher_alt_down() {
-            // Open the switcher as soon as Alt is held (before the first Tab).
-            if !self.switcher.active {
-                self.switcher.begin(ctx);
-                // Close any other overlay.
-                if self.power.open {
-                    self.power.close();
-                }
-                self.control_open = false;
-                self.control_state.submenu = modes::ControlSubmenu::None;
-            }
-            // Each Tab press advances the highlighted app.
+            // Each Tab press (while Alt is held) opens the switcher on the first
+            // tap and advances the highlight on subsequent taps.
             let tab_ms = win::switcher_tab_ms();
             if tab_ms != 0 && tab_ms != self.last_switcher_tab {
                 self.last_switcher_tab = tab_ms;
-                self.switcher.advance(1);
+                if !self.switcher.active {
+                    self.switcher.begin(ctx);
+                    // Close any other overlay.
+                    if self.power.open {
+                        self.power.close();
+                    }
+                    self.control_open = false;
+                    self.control_state.submenu = modes::ControlSubmenu::None;
+                } else {
+                    self.switcher.advance(1);
+                }
             }
-        } else {
-            // Alt released while switching → focus the selected app.
-            if self.switcher.active && win::take_alt_released(400) {
-                self.switcher.activate_selected();
-            }
+        }
+        // Alt released while switching → focus the selected app. Checked
+        // independently of the Alt-down branch so a fast release can't be missed.
+        if self.switcher.active && win::take_alt_released(500) {
+            self.switcher.activate_selected();
+        }
+        if !win::switcher_alt_down() {
             self.last_switcher_tab = 0;
         }
         // Grow the switcher in from the pill over a short ease.
@@ -937,6 +1031,7 @@ impl eframe::App for DynamicIslandApp {
                             accent,
                             &status,
                             self.status_icon_wifi.as_ref().unwrap(),
+                            self.status_icon_eth.as_ref().unwrap(),
                             self.status_icon_bt.as_ref().unwrap(),
                             self.status_icon_battery.as_ref().unwrap(),
                             pill_alpha,
@@ -952,16 +1047,24 @@ impl eframe::App for DynamicIslandApp {
                         }
                     }
                     IslandMode::Notification => {
-                        let notify_text = win::media_text().map(|m| m.title).unwrap_or_default();
-                    modes::draw_notification_mode(
-                        &painter,
-                        pill_rect,
-                        &self.cfg,
-                        accent,
-                        &notify_text,
-                        1.0,
-                    );
-                }
+                        let (small, big) = if let Some(n) = &self.notif {
+                            // Discord-style: "<username> on Discord" + message body.
+                            let img = format!("{} on {}", n.title, n.app);
+                            (img, n.body.clone())
+                        } else {
+                            let m = win::media_text().map(|m| (m.title, m.artist)).unwrap_or_default();
+                            ("Now Playing".to_string(), m.0)
+                        };
+                        modes::draw_notification_mode(
+                            &painter,
+                            pill_rect,
+                            &self.cfg,
+                            accent,
+                            &small,
+                            &big,
+                            1.0,
+                        );
+                    }
                 IslandMode::Volume => modes::draw_volume_mode(
                     &painter,
                     pill_rect,
@@ -1025,13 +1128,20 @@ impl eframe::App for DynamicIslandApp {
                         island_alpha,
                     ),
                     IslandMode::Notification => {
-                        let notify_text = win::media_text().map(|m| m.title).unwrap_or_default();
+                        let (small, big) = if let Some(n) = &self.notif {
+                            let img = format!("{} on {}", n.title, n.app);
+                            (img, n.body.clone())
+                        } else {
+                            let m = win::media_text().map(|m| (m.title, m.artist)).unwrap_or_default();
+                            ("Now Playing".to_string(), m.0)
+                        };
                         modes::draw_notification_mode(
                             &painter,
                             pill_rect,
                             &self.cfg,
                             accent,
-                            &notify_text,
+                            &small,
+                            &big,
                             island_alpha,
                         );
                     }
@@ -1065,6 +1175,19 @@ impl eframe::App for DynamicIslandApp {
                     dt,
                     content_alpha,
                 );
+            }
+
+            // Clicking outside the launcher panel (and not on the pill) closes it.
+            if self.launcher.open {
+                let clicked_outside = ctx.input(|i| {
+                    i.pointer.any_pressed()
+                        && i.pointer.interact_pos().map(|p| {
+                            !morph_rect.contains(p) && !pill_rect.contains(p)
+                        }).unwrap_or(false)
+                });
+                if clicked_outside {
+                    self.set_launcher_open(ctx, false);
+                }
             }
         }
 
@@ -1275,6 +1398,12 @@ fn formatted_clock(cfg: &Config) -> String {
     }
 }
 
+/// Whether we have a custom notification implementation for this app.
+/// Only these apps' notifications are surfaced; others are ignored.
+fn is_supported_notification_app(app: &str) -> bool {
+    app.eq_ignore_ascii_case("Discord")
+}
+
 /// e.g. "Sat, 22 Aug"
 fn formatted_day() -> String {
     Local::now().format("%a, %d %b").to_string()
@@ -1283,6 +1412,7 @@ fn formatted_day() -> String {
 const VOLUME_SVG_ON: &str = include_str!("assets/volume.svg");
 const VOLUME_SVG_OFF: &str = include_str!("assets/volume_muted.svg");
 const WIFI_SVG: &str = include_str!("assets/wifi.svg");
+const ETHERNET_SVG: &str = include_str!("assets/ethernet.svg");
 const BLUETOOTH_SVG: &str = include_str!("assets/bluetooth.svg");
 const BATTERY_SVG: &str = include_str!("assets/battery.svg");
 const SEARCH_SVG: &str = include_str!("assets/search.svg");
@@ -1366,6 +1496,8 @@ fn main() -> eframe::Result {
     win::start_media_key_hook();
     // Start system-status poller (battery / Wi-Fi / Bluetooth)
     win::start_status_poller();
+    // Start notification listener (reads Windows toast notifications)
+    win::start_notification_listener();
 
     let viewport = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, 0.0, 0.0);
     let options = eframe::NativeOptions {

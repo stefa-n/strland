@@ -1,0 +1,58 @@
+name: Build
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.project.name }} (${{ matrix.target }})
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+        # Each of the Strland components is its own Cargo package in its own
+        # directory. `bin` is the produced executable name (defaulting to the
+        # package name when it is not the same, e.g. strbar -> strland).
+        project:
+          - name: strpaper
+            bin: strpaper
+          - name: strbar
+            bin: strland
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        working-directory: ${{ matrix.project.name }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: pwsh
+        working-directory: ${{ matrix.project.name }}
+        run: |
+          $name = "${{ matrix.project.bin }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path dist
+          Compress-Archive `
+            -Path "target/${{ matrix.target }}/release/${{ matrix.project.bin }}.exe" `
+            -DestinationPath "dist/$name.zip"
+
+      - name: Publish build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.project.bin }}-${{ matrix.target }}
+          path: ${{ matrix.project.name }}/dist/*.zip
+          retention-days: 30

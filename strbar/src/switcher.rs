@@ -94,7 +94,7 @@ impl SwitcherState {
         let start_x = rect.center().x - real_w / 2.0;
         let start_y = rect.center().y - real_h / 2.0;
 
-        for (i, w) in self.windows.iter().enumerate() {
+        for i in 0..n {
             let row = i / cols;
             let col = i % cols;
             let x = start_x + col as f32 * (card_w + gap);
@@ -114,12 +114,10 @@ impl SwitcherState {
             };
             ui.painter().rect_filled(card, egui::CornerRadius::same(18), bgc);
 
-            let fg = if selected { egui::Color32::from_rgb(18, 18, 18) } else { egui::Color32::from_rgb(225, 225, 225) };
-
             // Icon (scaled to fit card).
-            let icon_side = (card_h * 0.42).min(44.0).max(24.0);
+            let icon_side = (card_h * 0.5).min(52.0).max(30.0);
             let icon_rect = egui::Rect::from_center_size(
-                egui::pos2(card.center().x, card.top() + icon_side * 0.6 + 8.0),
+                card.center(),
                 egui::vec2(icon_side, icon_side),
             );
             if let Some(icon) = self.icons.get(i) {
@@ -130,20 +128,6 @@ impl SwitcherState {
                     egui::Color32::WHITE,
                 );
             }
-
-            // Title (clipped).
-            let title_font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-            let galley = ui.painter().layout_no_wrap(w.title.clone(), title_font, fg);
-            let clip = egui::Rect::from_min_size(
-                egui::pos2(card.left() + 8.0, card.bottom() - 24.0),
-                egui::vec2(card.width() - 16.0, 22.0),
-            );
-            let clipped = ui.painter().with_clip_rect(clip);
-            clipped.galley(
-                egui::pos2(card.left() + 8.0, card.bottom() - 22.0),
-                galley,
-                egui::Color32::TRANSPARENT,
-            );
 
             if resp.clicked() {
                 self.index = i;

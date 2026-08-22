@@ -14,6 +14,7 @@ pub fn draw_status_icons(
     accent: egui::Color32,
     status: &win::SystemStatus,
     wifi: &egui::TextureHandle,
+    eth: &egui::TextureHandle,
     bt: &egui::TextureHandle,
     battery: &egui::TextureHandle,
     alpha: f32,
@@ -29,7 +30,11 @@ pub fn draw_status_icons(
 
     let mut items: Vec<(f32, &egui::TextureHandle)> = Vec::new();
 
-    if cfg.show_wifi && status.wifi_connected {
+    // Show a network icon: Wi-Fi when connected wirelessly, Ethernet when on a
+    // wired LAN.
+    if cfg.show_wifi && status.connection_type == 2 {
+        items.push((1.0, eth));
+    } else if cfg.show_wifi && status.wifi_connected {
         items.push((status.wifi_signal as f32 / 100.0, wifi));
     }
     if cfg.show_bluetooth && status.bluetooth_connected {

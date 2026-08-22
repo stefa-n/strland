@@ -32,6 +32,8 @@ unsafe extern "system" {
     fn SetWindowLongPtrW(hWnd: isize, nIndex: i32, dwNewLong: isize) -> isize;
     fn GetWindowLongPtrW(hWnd: isize, nIndex: i32) -> isize;
     fn SetForegroundWindow(hWnd: isize) -> i32;
+    fn AttachThreadInput(id_attach: u32, id_attach_to: u32, f_attach: i32) -> i32;
+    fn GetCurrentThreadId() -> u32;
     fn waveOutGetVolume(hwo: usize, pdw_volume: *mut u32) -> u32;
     fn ShellExecuteW(
         hwnd: isize,
@@ -774,6 +776,8 @@ static CONTROL_OPEN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 #[cfg(target_os = "windows")]
 static WIN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "windows")]
+static WIN_DOWN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "windows")]
 static ALT_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static SWITCHER_TAB_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -935,6 +939,7 @@ pub fn start_media_key_hook() {
                     if kb.vkCode == VK_LWIN || kb.vkCode == VK_RWIN {
                         if wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN {
                             WIN_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+                            WIN_DOWN_MS.store(tick_ms(), std::sync::atomic::Ordering::Relaxed);
                             SUPER_KEY_MS.store(tick_ms(), Ordering::Relaxed);
                         } else if wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP {
                             WIN_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -975,9 +980,12 @@ pub fn start_media_key_hook() {
                     }
 
                     if wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN {
-                        // Win+A → open the control center. Swallow it so no other
-                        // app (e.g. the shell) captures the shortcut.
-                        if kb.vkCode == VK_A && WIN_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Win+A → open the control center. Only fire if the 'A'
+                        // arrives within a short window of the Win press so a bare
+                        // Win keypress can't combine with a later 'a' keystroke.
+                        let win_was_recent = WIN_DOWN.load(std::sync::atomic::Ordering::Relaxed)
+                            && tick_ms().saturating_sub(WIN_DOWN_MS.load(std::sync::atomic::Ordering::Relaxed)) < 500;
+                        if kb.vkCode == VK_A && win_was_recent {
                             CONTROL_OPEN_MS.store(tick_ms(), Ordering::Relaxed);
                             return LRESULT(1);
                         }
@@ -1049,6 +1057,153 @@ pub fn perform_power_action(action: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Notifications – read toast notifications via UserNotificationListener
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct NotificationInfo {
+    pub id: u32,
+    pub app: String,
+    pub title: String,
+    pub body: String,
+}
+
+#[cfg(target_os = "windows")]
+static NOTIFICATIONS: std::sync::Mutex<Vec<NotificationInfo>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(target_os = "windows")]
+static NEW_NOTIFICATION_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static LATEST_NOTIF: std::sync::Mutex<Option<NotificationInfo>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+pub fn take_latest_notification() -> Option<NotificationInfo> {
+    LATEST_NOTIF.lock().ok().and_then(|mut g| g.take())
+}
+
+/// Timestamp of the most recent "new" notification (a previously-unseen id),
+/// if one arrived within `max_age_ms`. Consumes the event once.
+#[cfg(target_os = "windows")]
+pub fn take_new_notification(max_age_ms: u64) -> bool {
+    let stamp = NEW_NOTIFICATION_MS.load(Ordering::Relaxed);
+    if stamp == 0 {
+        return false;
+    }
+    if tick_ms().saturating_sub(stamp) > max_age_ms {
+        NEW_NOTIFICATION_MS.store(0, Ordering::Relaxed);
+        return false;
+    }
+    NEW_NOTIFICATION_MS.store(0, Ordering::Relaxed);
+    true
+}
+
+/// Polls Windows toast notifications on a background thread and flags new ones.
+#[cfg(target_os = "windows")]
+pub fn start_notification_listener() {
+    use windows::UI::Notifications::Management::UserNotificationListener;
+    use windows::UI::Notifications::NotificationKinds;
+    use windows::Foundation::Collections::IVectorView;
+
+    std::thread::Builder::new()
+        .name("notifications".into())
+        .spawn(move || {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            }
+            let listener = match UserNotificationListener::Current() {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[notify] UserNotificationListener::Current failed: {e:?}");
+                    return;
+                }
+            };
+
+            // Request access (needed to read notifications).
+            match listener.RequestAccessAsync().and_then(|op| op.get()) {
+                Ok(status) => eprintln!("[notify] access status = {}", status.0),
+                Err(e) => eprintln!("[notify] RequestAccessAsync failed: {e:?}"),
+            }
+
+            let mut known: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            loop {
+                match listener.GetNotificationsAsync(NotificationKinds(1)).and_then(|op| op.get()) {
+                    Ok(view) => {
+                        let list: IVectorView<windows::UI::Notifications::UserNotification> = view;
+                        let count = list.Size().unwrap_or(0);
+                        let mut snapshot = Vec::new();
+                        for i in 0..count {
+                            if let Ok(un) = list.GetAt(i) {
+                                let info = extract_notification(&un);
+                                let id = info.id;
+                                if !known.contains(&id) {
+                                    known.insert(id);
+                                    NEW_NOTIFICATION_MS.store(tick_ms(), Ordering::Relaxed);
+                                    // Stash this specific notification so the UI can
+                                    // read it without racing the stale full list.
+                                    if let Ok(mut slot) = LATEST_NOTIF.lock() {
+                                        *slot = Some(info.clone());
+                                    }
+                                }
+                                if !info.title.is_empty() || !info.body.is_empty() {
+                                    snapshot.push(info);
+                                }
+                            }
+                        }
+                        if let Ok(mut g) = NOTIFICATIONS.lock() {
+                            *g = snapshot;
+                        }
+                    }
+                    Err(e) => eprintln!("[notify] GetNotificationsAsync failed: {e:?}"),
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        })
+        .ok();
+}
+
+#[cfg(target_os = "windows")]
+fn extract_notification(
+    un: &windows::UI::Notifications::UserNotification,
+) -> NotificationInfo {
+    let id = un.Id().unwrap_or(0);
+    let app = un
+        .AppInfo()
+        .ok()
+        .and_then(|a| a.DisplayInfo().ok())
+        .and_then(|d| d.DisplayName().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let (title, body) = notification_text(un);
+    NotificationInfo { id, app, title, body }
+}
+
+#[cfg(target_os = "windows")]
+fn notification_text(un: &windows::UI::Notifications::UserNotification) -> (String, String) {
+    use windows::UI::Notifications::KnownNotificationBindings;
+    let Ok(notif) = un.Notification() else { return (String::new(), String::new()) };
+    let Ok(visual) = notif.Visual() else { return (String::new(), String::new()) };
+    let Ok(template) = KnownNotificationBindings::ToastGeneric() else { return (String::new(), String::new()) };
+    let Ok(binding) = visual.GetBinding(&template) else { return (String::new(), String::new()) };
+    let Ok(texts) = binding.GetTextElements() else { return (String::new(), String::new()) };
+    let count = texts.Size().unwrap_or(0);
+    let mut strings = Vec::new();
+    for i in 0..count {
+        if let Ok(t) = texts.GetAt(i) {
+            if let Ok(s) = t.Text() {
+                let s = s.to_string();
+                if !s.is_empty() {
+                    strings.push(s);
+                }
+            }
+        }
+    }
+    let title = strings.first().cloned().unwrap_or_default();
+    let body = strings.get(1).cloned().unwrap_or_default();
+    (title, body)
+}
+
 // ---------------------------------------------------------------------------
 // App icons – HICON → RGBA pixels for the launcher
 // ---------------------------------------------------------------------------
@@ -1317,6 +1472,13 @@ pub fn system_status() -> SystemStatus { SystemStatus::default() }
 #[cfg(not(target_os = "windows"))]
 pub fn start_status_poller() {}
 
+#[cfg(not(target_os = "windows"))]
+pub fn take_latest_notification() -> Option<NotificationInfo> { None }
+#[cfg(not(target_os = "windows"))]
+pub fn take_new_notification(_max_age_ms: u64) -> bool { false }
+#[cfg(not(target_os = "windows"))]
+pub fn start_notification_listener() {}
+
 #[cfg(target_os = "windows")]
 fn fetch_media_properties(
     session: &windows::Media::Control::GlobalSystemMediaTransportControlsSession,
@@ -1391,6 +1553,8 @@ pub struct SystemStatus {
     pub wifi_connected: bool,
     pub wifi_signal: u8, // 0-100
     pub bluetooth_connected: bool,
+    /// 0 = none, 1 = Wi-Fi, 2 = Ethernet (wired LAN).
+    pub connection_type: u8,
 }
 
 impl Default for SystemStatus {
@@ -1402,6 +1566,7 @@ impl Default for SystemStatus {
             wifi_connected: false,
             wifi_signal: 0,
             bluetooth_connected: false,
+            connection_type: 0,
         }
     }
 }
@@ -1414,6 +1579,7 @@ static SYSTEM_STATUS: std::sync::RwLock<SystemStatus> = std::sync::RwLock::new(S
     wifi_connected: false,
     wifi_signal: 0,
     bluetooth_connected: false,
+    connection_type: 0,
 });
 
 #[cfg(target_os = "windows")]
@@ -1465,8 +1631,44 @@ fn poll_system_status() -> SystemStatus {
 
     status.wifi_connected = win_check_wifi(&mut status.wifi_signal);
     status.bluetooth_connected = win_check_bluetooth();
+    status.connection_type = win_connection_type(status.wifi_connected);
 
     status
+}
+
+/// Determines the active connection type: 2 = Ethernet, 1 = Wi-Fi, 0 = none.
+#[cfg(target_os = "windows")]
+fn win_connection_type(wifi_connected: bool) -> u8 {
+    if wifi_connected {
+        return 1;
+    }
+    // Check for an active wired (Ethernet) adapter.
+    use windows::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, IF_TYPE_IEEE80211, IP_ADAPTER_INFO};
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+    const ERROR_SUCCESS: u32 = 0;
+    const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
+    unsafe {
+        let mut size: u32 = 0;
+        let mut rc = GetAdaptersInfo(None, &mut size);
+        if rc != ERROR_BUFFER_OVERFLOW {
+            return 0;
+        }
+        let mut buf = vec![0u8; size as usize];
+        rc = GetAdaptersInfo(Some(buf.as_mut_ptr().cast::<IP_ADAPTER_INFO>()), &mut size);
+        if rc != ERROR_SUCCESS {
+            return 0;
+        }
+        let mut cur = buf.as_ptr().cast::<IP_ADAPTER_INFO>();
+        while !cur.is_null() {
+            let info = &*cur;
+            if info.Type != IF_TYPE_IEEE80211 && info.Type == IF_TYPE_ETHERNET_CSMACD {
+                // The adapter is the wired type we care about; treat as Ethernet.
+                return 2;
+            }
+            cur = info.Next;
+        }
+        0
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1947,6 +2149,7 @@ fn dot11_ssid_to_string(ssid: &windows::Win32::NetworkManagement::WiFi::DOT11_SS
 #[derive(Clone)]
 pub struct SwitcherWindow {
     pub hwnd: isize,
+    #[allow(dead_code)]
     pub title: String,
 }
 
@@ -2014,13 +2217,29 @@ pub fn activate_switch_window(hwnd_isize: isize) {
         ASFW_ANY,
     };
     unsafe {
-        // Grant ourselves permission to set the foreground window (the app can
-        // be backgrounded, which normally blocks SetForegroundWindow).
         let _ = AllowSetForegroundWindow(ASFW_ANY);
         let hwnd = windows::Win32::Foundation::HWND(hwnd_isize as *mut core::ffi::c_void);
         let _ = ShowWindow(hwnd, SW_RESTORE);
+
+        // Games and other apps often reject SetForegroundWindow from a background
+        // process. Attaching our input thread to the target's input thread bypasses
+        // the foreground lock so focus is granted reliably.
+        let target_thread = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+            hwnd,
+            None,
+        );
+        let our_thread = GetCurrentThreadId();
+        let mut attached = false;
+        if target_thread != 0 && target_thread != our_thread {
+            attached = AttachThreadInput(our_thread, target_thread, 1) != 0;
+        }
+
         let _ = BringWindowToTop(hwnd);
         let _ = SetForegroundWindow(hwnd);
+
+        if attached {
+            let _ = AttachThreadInput(our_thread, target_thread, 0);
+        }
     }
 }
 
