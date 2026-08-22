@@ -2,6 +2,7 @@ mod config;
 mod launcher;
 mod modes;
 mod power;
+mod switcher;
 mod win;
 
 use chrono::Local;
@@ -57,9 +58,13 @@ fn island_viewport_size(
     hover_anim: f32,
     power_open: bool,
     control_open: bool,
+    switcher_active: bool,
     power_anim: f32,
     control_anim: f32,
 ) -> egui::Vec2 {
+    if switcher_active {
+        return egui::vec2(760.0, 520.0);
+    }
     let closed_width = (cfg.width * cfg.volume_expand_factor).max(cfg.width) + 64.0;
     let open_width = closed_width.max(cfg.launcher_width + 40.0);
     let closed_height = cfg.height + cfg.border_radius * 2.0 + 16.0;
@@ -180,6 +185,9 @@ struct DynamicIslandApp {
     power: power::PowerMenuState,
     power_icons: Option<[egui::TextureHandle; 5]>,
 
+    switcher: switcher::SwitcherState,
+    last_switcher_tab: u64,
+
     control_open: bool,
     control_state: modes::ControlCenterState,
     control_icons: Option<modes::ControlCenterIcons>,
@@ -214,7 +222,7 @@ impl DynamicIslandApp {
         let hwnd = None;
 
         let now = Instant::now();
-        let viewport_size = island_viewport_size(&cfg, 0.0, 0.0, false, false, 0.0, 0.0);
+        let viewport_size = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, 0.0, 0.0);
         let start_y = -(viewport_size.y + cfg.y_padding);
         let clock = formatted_clock(&cfg);
         let day = formatted_day();
@@ -258,6 +266,8 @@ impl DynamicIslandApp {
             media_art_gen: 0,
             power: power::PowerMenuState::new(),
             power_icons: None,
+            switcher: switcher::SwitcherState::new(),
+            last_switcher_tab: 0,
             control_open: false,
             control_state: modes::ControlCenterState::default(),
             control_icons: None,
@@ -271,7 +281,7 @@ impl DynamicIslandApp {
     }
 
     fn sync_viewport_size(&mut self, ctx: &egui::Context) {
-        let desired = island_viewport_size(&self.cfg, self.launcher.anim, self.hover_anim, self.power.open, self.control_open, self.power.anim, self.control_anim);
+        let desired = island_viewport_size(&self.cfg, self.launcher.anim, self.hover_anim, self.power.open, self.control_open, self.switcher.active || self.switcher.anim > 0.001, self.power.anim, self.control_anim);
         if desired == self.viewport_size {
             return;
         }
@@ -285,10 +295,17 @@ impl DynamicIslandApp {
             let phys_w = desired.x * scale;
             let phys_h = desired.y * scale;
             let x = ((win::get_screen_width() as f32 - phys_w) / 2.0).round() as i32;
+            // The switcher overlay is vertically centered on screen.
+            let y = if self.switcher.active || self.switcher.anim > 0.001 {
+                let screen_h = win::get_screen_height();
+                ((screen_h as f32 - phys_h) / 2.0).round() as i32
+            } else {
+                self.current_y.round() as i32
+            };
             win::set_position_and_size(
                 hwnd,
                 x,
-                self.current_y.round() as i32,
+                y,
                 phys_w.round() as i32,
                 phys_h.round() as i32,
             );
@@ -581,9 +598,11 @@ impl eframe::App for DynamicIslandApp {
         // Media playing is polled on a background thread — just read the atomic
         self.media_playing = win::media_is_playing();
 
-        // Song change → brief "Now Playing" notification.
+        // Song change → brief "Now Playing" notification (suppressed in Peace
+        // / Do-Not-Disturb mode).
         if self.mode == IslandMode::Clock
             && self.media_playing
+            && !self.control_state.dnd
             && win::take_track_change(400)
         {
             self.mode = IslandMode::Notification;
@@ -675,6 +694,59 @@ impl eframe::App for DynamicIslandApp {
             }
         } else {
             self.had_panel_focus = false;
+        }
+
+        // Global Escape closes any overlay, even when another app has focus.
+        if win::take_escape(300) {
+            if self.switcher.active {
+                self.switcher.dismiss();
+            }
+            if self.power.open {
+                self.power.close();
+            }
+            if self.control_open {
+                if self.control_state.submenu != modes::ControlSubmenu::None {
+                    self.control_state.submenu = modes::ControlSubmenu::None;
+                } else {
+                    self.control_open = false;
+                }
+            }
+            if self.launcher.open {
+                self.set_launcher_open(ctx, false);
+            }
+        }
+
+        // --- Alt+Tab app switcher lifecycle ---
+        if win::switcher_alt_down() {
+            // Open the switcher as soon as Alt is held (before the first Tab).
+            if !self.switcher.active {
+                self.switcher.begin(ctx);
+                // Close any other overlay.
+                if self.power.open {
+                    self.power.close();
+                }
+                self.control_open = false;
+                self.control_state.submenu = modes::ControlSubmenu::None;
+            }
+            // Each Tab press advances the highlighted app.
+            let tab_ms = win::switcher_tab_ms();
+            if tab_ms != 0 && tab_ms != self.last_switcher_tab {
+                self.last_switcher_tab = tab_ms;
+                self.switcher.advance(1);
+            }
+        } else {
+            // Alt released while switching → focus the selected app.
+            if self.switcher.active && win::take_alt_released(400) {
+                self.switcher.activate_selected();
+            }
+            self.last_switcher_tab = 0;
+        }
+        // Grow the switcher in from the pill over a short ease.
+        let sw_target = if self.switcher.active { 1.0 } else { 0.0 };
+        let (sw_anim, _) = smooth_step(self.switcher.anim, sw_target, dt, 10.0);
+        self.switcher.anim = sw_anim;
+        if !self.switcher.active && self.switcher.anim <= 0.001 {
+            self.switcher.anim = 0.0;
         }
 
         // --- Animations ---
@@ -1124,12 +1196,37 @@ impl eframe::App for DynamicIslandApp {
             }
         }
 
+        // --- Alt+Tab app switcher overlay ---
+        // Render while active OR animating out, growing from the pill to a
+        // centered panel.
+        if self.switcher.active || self.switcher.anim > 0.001 {
+            let se = ease_out_cubic(self.switcher.anim);
+            let sw_w = viewport_rect.width().min(760.0);
+            let sw_h = viewport_rect.height().min(520.0);
+            let target = egui::Rect::from_center_size(viewport_rect.center(), egui::vec2(sw_w, sw_h));
+            // Grow out of the clock pill (top-center of the viewport).
+            let start = egui::Rect::from_center_size(
+                egui::pos2(viewport_rect.center().x, pill_rect.center().y),
+                egui::vec2(pill_rect.width(), pill_rect.height()),
+            );
+            let sw_rect = lerp_rect(start, target, se);
+            let accent = Config::parse_color(&self.cfg.accent_color);
+            egui::Area::new(egui::Id::new("app_switcher"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(sw_rect.min)
+                .movable(false)
+                .show(ctx, |ui| {
+                    self.switcher.draw(ui, sw_rect, &self.cfg, accent, se);
+                });
+        }
+
         // --- Repaint scheduling ---
         let launcher_animating = self.launcher.anim > 0.001 && self.launcher.anim < 0.999;
         let hover_animating = self.hover_anim > 0.001 && self.hover_anim < 0.999;
         let power_animating = self.power.anim > 0.001 && self.power.anim < 0.999;
         let control_animating = self.control_anim > 0.001 && self.control_anim < 0.999;
-        let animating = self.y_animating || self.width_animating || launcher_animating || hover_animating || power_animating || control_animating;
+        let switcher_animating = self.switcher.active || (self.switcher.anim > 0.001 && self.switcher.anim < 0.999);
+        let animating = self.y_animating || self.width_animating || launcher_animating || hover_animating || power_animating || control_animating || switcher_animating;
         let viz_active = self.visualizer_visibility > 0.01;
         let notification_active = self.mode == IslandMode::Notification;
         // A marquee-scrolling media title needs continuous repaints even after
@@ -1137,7 +1234,14 @@ impl eframe::App for DynamicIslandApp {
         let hover_expanded = self.hover_anim > 0.05 && self.mode == IslandMode::Clock;
         let scrolling_title = hover_expanded && win::media_text().map(|m| m.title).is_some();
 
-        if animating {
+        if self.switcher.active {
+            // Alt+Tab switcher needs immediate repaints so Tab-taps / highlight
+            // update as fast as the key repeats.
+            ctx.request_repaint();
+        } else if self.switcher.anim > 0.001 {
+            // Switcher still animating out.
+            ctx.request_repaint();
+        } else if animating {
             // During animation: request repaint immediately, no sleep
             ctx.request_repaint();
         } else if viz_active {
@@ -1263,7 +1367,7 @@ fn main() -> eframe::Result {
     // Start system-status poller (battery / Wi-Fi / Bluetooth)
     win::start_status_poller();
 
-    let viewport = island_viewport_size(&cfg, 0.0, 0.0, false, false, 0.0, 0.0);
+    let viewport = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, 0.0, 0.0);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([viewport.x, viewport.y])

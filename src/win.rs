@@ -180,6 +180,11 @@ pub fn reset_pos_cache() {
     last_pos::save(i32::MIN, i32::MIN, i32::MIN, i32::MIN);
 }
 
+#[cfg(target_os = "windows")]
+pub fn get_screen_height() -> i32 {
+    unsafe { GetSystemMetrics(SM_CYSCREEN) }
+}
+
 /// Logical points → physical pixels factor for the given window (1.25 at 125% scaling).
 #[cfg(target_os = "windows")]
 pub fn window_scale(hwnd: isize) -> f32 {
@@ -768,6 +773,14 @@ static SUPER_KEY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 static CONTROL_OPEN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(target_os = "windows")]
 static WIN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static ALT_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static SWITCHER_TAB_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static ALT_RELEASED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static ESC_PRESSED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Millis since boot (matches GetTickCount64 stamps from the hook thread).
 #[cfg(target_os = "windows")]
@@ -802,6 +815,49 @@ pub fn take_control_open(max_age_ms: u64) -> bool {
         return false;
     }
     CONTROL_OPEN_MS.store(0, Ordering::Relaxed);
+    true
+}
+
+/// True if the Alt key is currently held (drives the Alt+Tab switcher lifecycle).
+#[cfg(target_os = "windows")]
+pub fn switcher_alt_down() -> bool {
+    ALT_DOWN.load(Ordering::Relaxed)
+}
+
+/// Timestamp of the most recent Tab-tap while Alt is held, or 0 if none.
+#[cfg(target_os = "windows")]
+pub fn switcher_tab_ms() -> u64 {
+    SWITCHER_TAB_MS.load(Ordering::Relaxed)
+}
+
+/// Consumes the Alt-released event, firing once when Alt is let go.
+#[cfg(target_os = "windows")]
+pub fn take_alt_released(max_age_ms: u64) -> bool {
+    let stamp = ALT_RELEASED_MS.load(Ordering::Relaxed);
+    if stamp == 0 {
+        return false;
+    }
+    if tick_ms().saturating_sub(stamp) > max_age_ms {
+        ALT_RELEASED_MS.store(0, Ordering::Relaxed);
+        return false;
+    }
+    ALT_RELEASED_MS.store(0, Ordering::Relaxed);
+    true
+}
+
+/// True if the Escape key was pressed within `max_age_ms` (consumes the event),
+/// so overlays close even when the window isn't focused.
+#[cfg(target_os = "windows")]
+pub fn take_escape(max_age_ms: u64) -> bool {
+    let stamp = ESC_PRESSED_MS.load(Ordering::Relaxed);
+    if stamp == 0 {
+        return false;
+    }
+    if tick_ms().saturating_sub(stamp) > max_age_ms {
+        ESC_PRESSED_MS.store(0, Ordering::Relaxed);
+        return false;
+    }
+    ESC_PRESSED_MS.store(0, Ordering::Relaxed);
     true
 }
 
@@ -848,12 +904,19 @@ pub fn start_media_key_hook() {
     const WM_KEYDOWN: usize = 0x0100;
     const WM_SYSKEYDOWN: usize = 0x0104;
     const WM_KEYUP: usize = 0x0101;
+    const WM_SYSKEYUP: usize = 0x0105;
     const VK_VOLUME_UP: u32 = 0xAF;
     const VK_VOLUME_DOWN: u32 = 0xAE;
     const VK_VOLUME_MUTE: u32 = 0xAD;
     const VK_LWIN: u32 = 0x5B;
     const VK_RWIN: u32 = 0x5C;
     const VK_A: u32 = 0x41;
+    const VK_LMENU: u32 = 0xA4;
+    const VK_RMENU: u32 = 0xA5;
+    const VK_MENU: u32 = 0x12;
+    const VK_TAB: u32 = 0x09;
+    const VK_ESCAPE: u32 = 0x1B;
+
 
     unsafe extern "system" fn ll_key_proc(
         code: i32,
@@ -866,20 +929,52 @@ pub fn start_media_key_hook() {
                 // Only real (non-injected) presses.
                 let real = (kb.flags & LLKHF_INJECTED).0 == 0;
                 if real {
-                    // Track the Super/Windows key state for Win+<key> combos.
+                    // Track the Super/Windows key state for Win+<key> combos, and
+                    // swallow the Win key itself so the shell's Start menu doesn't
+                    // steal focus (keeps our launcher from insta-closing).
                     if kb.vkCode == VK_LWIN || kb.vkCode == VK_RWIN {
                         if wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN {
                             WIN_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
-                        } else if wparam.0 == WM_KEYUP {
+                            SUPER_KEY_MS.store(tick_ms(), Ordering::Relaxed);
+                        } else if wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP {
                             WIN_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
+                        return LRESULT(1); // exclusive — no native Start menu
+                    }
+
+                    // Alt+Tab switcher: track Alt on both normal & sys messages
+                    // (Alt is delivered to apps as WM_SYS*), and swallow Tab so
+                    // the default switcher never appears.
+                    let is_alt = kb.vkCode == VK_LMENU || kb.vkCode == VK_RMENU || kb.vkCode == VK_MENU;
+                    if is_alt {
+                        if wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN {
+                            ALT_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+                        } else if wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP {
+                            ALT_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+                            ALT_RELEASED_MS.store(tick_ms(), Ordering::Relaxed);
+                        }
+                    }
+                    let is_tab_key = wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN;
+                    let is_tab_up = wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP;
+                    if (is_tab_key || is_tab_up)
+                        && kb.vkCode == VK_TAB
+                        && ALT_DOWN.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        if is_tab_key {
+                            SWITCHER_TAB_MS.store(tick_ms(), Ordering::Relaxed);
+                        }
+                        return LRESULT(1); // swallow — we handle Alt+Tab ourselves
+                    }
+
+                    // Global Escape detection — closes overlays even when another
+                    // app has focus.
+                    if (wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN)
+                        && kb.vkCode == VK_ESCAPE
+                    {
+                        ESC_PRESSED_MS.store(tick_ms(), Ordering::Relaxed);
                     }
 
                     if wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN {
-                        // Super/Windows key alone → open the app launcher.
-                        if kb.vkCode == VK_LWIN || kb.vkCode == VK_RWIN {
-                            SUPER_KEY_MS.store(tick_ms(), Ordering::Relaxed);
-                        }
                         // Win+A → open the control center. Swallow it so no other
                         // app (e.g. the shell) captures the shortcut.
                         if kb.vkCode == VK_A && WIN_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1030,6 +1125,37 @@ fn extract_icon_via_fileinfo(path: &Path) -> Option<AppIconPixels> {
         let px = pixels_from_hicon(sfi.hIcon);
         let _ = DestroyIcon(sfi.hIcon);
         px
+    }
+}
+
+/// Extracts a window's icon (large) into RGBA pixels, falling back to the
+/// window class icon. Used by the Alt+Tab switcher thumbnails.
+#[cfg(target_os = "windows")]
+pub fn extract_app_icon_for_window(hwnd_isize: isize) -> Option<AppIconPixels> {
+    #[cfg(target_os = "windows")]
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassLongPtrW, SendMessageW, GCLP_HICON, ICON_BIG, WM_GETICON,
+    };
+
+    unsafe {
+        let hwnd = windows::Win32::Foundation::HWND(hwnd_isize as *mut core::ffi::c_void);
+        // Try the window icon first, then the class icon.
+        let lr = SendMessageW(
+            hwnd,
+            WM_GETICON,
+            windows::Win32::Foundation::WPARAM(ICON_BIG as usize),
+            windows::Win32::Foundation::LPARAM(0),
+        );
+        let mut icon = windows::Win32::UI::WindowsAndMessaging::HICON(lr.0 as *mut core::ffi::c_void);
+        if icon.is_invalid() {
+            icon = windows::Win32::UI::WindowsAndMessaging::HICON(
+                GetClassLongPtrW(hwnd, GCLP_HICON) as *mut core::ffi::c_void,
+            );
+        }
+        if icon.is_invalid() {
+            return None;
+        }
+        pixels_from_hicon(icon)
     }
 }
 
@@ -1815,6 +1941,90 @@ fn dot11_ssid_to_string(ssid: &windows::Win32::NetworkManagement::WiFi::DOT11_SS
 }
 
 // ---------------------------------------------------------------------------
+// Alt+Tab - enumerate top-level windows (for the custom app switcher)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct SwitcherWindow {
+    pub hwnd: isize,
+    pub title: String,
+}
+
+/// Enumerates visible, titled top-level windows in z-order (topmost first),
+/// excluding tool windows — the windows shown by the native Alt+Tab switcher.
+#[cfg(target_os = "windows")]
+pub fn list_switch_windows() -> Vec<SwitcherWindow> {
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+    unsafe {
+        extern "system" fn enum_proc(hwnd: windows::Win32::Foundation::HWND, lparam: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
+            unsafe {
+                let out = &mut *(lparam.0 as *mut Vec<SwitcherWindow>);
+                if let Some(w) = switch_window_info(hwnd) {
+                    out.push(w);
+                }
+            }
+            windows::Win32::Foundation::BOOL(1)
+        }
+        let mut out = Vec::new();
+        let _ = EnumWindows(Some(enum_proc), windows::Win32::Foundation::LPARAM(&mut out as *mut _ as isize));
+        out
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn switch_window_info(hwnd: windows::Win32::Foundation::HWND) -> Option<SwitcherWindow> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowTextLengthW, GetWindowTextW, GetWindowLongPtrW, IsWindowVisible, GWL_EXSTYLE,
+    };
+
+    const WS_EX_TOOLWINDOW: i32 = 0x00000080;
+    const WS_EX_APPWINDOW: i32 = 0x00040000;
+
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() {
+            return None;
+        }
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as i32;
+        if ex & WS_EX_TOOLWINDOW != 0 && ex & WS_EX_APPWINDOW == 0 {
+            return None;
+        }
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let read = GetWindowTextW(hwnd, &mut buf);
+        if read == 0 {
+            return None;
+        }
+        let title = wide_to_string(&buf[..read as usize]);
+        if title.trim().is_empty() {
+            return None;
+        }
+        Some(SwitcherWindow { hwnd: hwnd.0 as isize, title })
+    }
+}
+
+/// Brings a window to the foreground (and restores it if minimized).
+#[cfg(target_os = "windows")]
+pub fn activate_switch_window(hwnd_isize: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AllowSetForegroundWindow, BringWindowToTop, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        ASFW_ANY,
+    };
+    unsafe {
+        // Grant ourselves permission to set the foreground window (the app can
+        // be backgrounded, which normally blocks SetForegroundWindow).
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        let hwnd = windows::Win32::Foundation::HWND(hwnd_isize as *mut core::ffi::c_void);
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App launching
 // ---------------------------------------------------------------------------
 
@@ -1846,6 +2056,8 @@ pub fn set_position_and_size(_hwnd: isize, _x: i32, _y: i32, _width: i32, _heigh
 pub fn reset_pos_cache() {}
 #[cfg(not(target_os = "windows"))]
 pub fn get_screen_width() -> i32 { 1920 }
+#[cfg(not(target_os = "windows"))]
+pub fn get_screen_height() -> i32 { 1080 }
 #[cfg(not(target_os = "windows"))]
 pub fn window_scale(_hwnd: isize) -> f32 { 1.0 }
 #[cfg(not(target_os = "windows"))]
@@ -1880,6 +2092,18 @@ pub fn take_super_key(_max_age_ms: u64) -> bool { false }
 #[cfg(not(target_os = "windows"))]
 pub fn take_control_open(_max_age_ms: u64) -> bool { false }
 #[cfg(not(target_os = "windows"))]
+pub fn switcher_alt_down() -> bool { false }
+#[cfg(not(target_os = "windows"))]
+pub fn switcher_tab_ms() -> u64 { 0 }
+#[cfg(not(target_os = "windows"))]
+pub fn take_alt_released(_max_age_ms: u64) -> bool { false }
+#[cfg(not(target_os = "windows"))]
+pub fn take_escape(_max_age_ms: u64) -> bool { false }
+#[cfg(not(target_os = "windows"))]
+pub fn list_switch_windows() -> Vec<SwitcherWindow> { Vec::new() }
+#[cfg(not(target_os = "windows"))]
+pub fn activate_switch_window(_hwnd: isize) {}
+#[cfg(not(target_os = "windows"))]
 pub fn perform_power_action(_action: u32) -> bool { false }
 #[cfg(not(target_os = "windows"))]
 pub fn start_media_key_hook() {}
@@ -1887,6 +2111,8 @@ pub fn start_media_key_hook() {}
 pub fn get_mute() -> bool { false }
 #[cfg(not(target_os = "windows"))]
 pub fn extract_app_icon(_path: &std::path::Path) -> Option<AppIconPixels> { None }
+#[cfg(not(target_os = "windows"))]
+pub fn extract_app_icon_for_window(_hwnd: isize) -> Option<AppIconPixels> { None }
 
 #[cfg(not(target_os = "windows"))]
 pub const AUDIO_BANDS: usize = 4;
