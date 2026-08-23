@@ -57,6 +57,7 @@ pub struct VideoPlayer {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     started: Instant,
+    hw: bool,
 }
 
 impl VideoPlayer {
@@ -66,7 +67,11 @@ impl VideoPlayer {
     /// `target` is the output size to decode into (typically the monitor
     /// resolution) — decoding straight to screen size avoids converting and
     /// blitting far more pixels than will ever be shown.
-    pub fn open(path: &Path, target: Option<(u32, u32)>) -> Result<VideoPlayer, String> {
+    pub fn open(
+        path: &Path,
+        target: Option<(u32, u32)>,
+        hw: bool,
+    ) -> Result<VideoPlayer, String> {
         let shared = Arc::new(Mutex::new(Shared {
             current: Arc::new(Raster {
                 width: 0,
@@ -83,7 +88,7 @@ impl VideoPlayer {
 
         let handle = thread::Builder::new()
             .name("strpaper-video".into())
-            .spawn(move || run_loop(path, target, s, st))
+            .spawn(move || run_loop(path, target, hw, s, st))
             .map_err(|e| format!("spawn decode thread failed: {e}"))?;
 
         Ok(VideoPlayer {
@@ -91,6 +96,7 @@ impl VideoPlayer {
             stop,
             handle: Some(handle),
             started: Instant::now(),
+            hw,
         })
     }
 
@@ -113,6 +119,11 @@ impl VideoPlayer {
         } else {
             false
         }
+    }
+
+    /// True when this player was opened with GPU decoding.
+    pub fn is_hw(&self) -> bool {
+        self.hw
     }
 
     /// The reason the media could not be decoded, if applicable.
@@ -161,33 +172,34 @@ fn mark_failed(shared: &Arc<Mutex<Shared>>, err: String) {
 fn run_loop(
     path: PathBuf,
     target: Option<(u32, u32)>,
+    hw: bool,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
 ) {
     // COM must be initialised on this thread before using Media Foundation.
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 
-    let mut reader: Option<Reader> = match Reader::new(&path, target) {
-        Ok(r) => {
-            crate::logger::log(&format!(
-                "video: opened {} ({}x{}, fmt={})",
-                path.display(),
-                r.width,
-                r.height,
-                fmt_name(r.fmt)
-            ));
-            Some(r)
+    // The GPU device is created once and reused across end-of-stream reopens.
+    let gpu = if hw {
+        match crate::gpu::Gpu::new() {
+            Ok(g) => Some(Arc::new(g)),
+            Err(e) => {
+                crate::logger::log(&format!("video: GPU unavailable ({e}); using software decode"));
+                None
+            }
         }
+    } else {
+        None
+    };
+
+    let mut reader: Option<Reader> = match Reader::new(&path, target, gpu.clone()) {
+        Ok(r) => Some(r),
         Err(e) => {
-            mark_failed(&shared, e.clone());
-            crate::logger::log(&format!("video: open failed: {e}"));
+            mark_failed(&shared, e);
             let _ = unsafe { CoUninitialize() };
             return;
         }
     };
-
-    let mut frame_count: u64 = 0;
-    let mut again_count: u64 = 0;
 
     while !stop.load(Ordering::SeqCst) {
         let Some(r) = reader.as_mut() else {
@@ -196,15 +208,6 @@ fn run_loop(
         match r.next() {
             Next::Frame(frame) => {
                 let dur = r.frame_dur;
-                frame_count += 1;
-                if frame_count <= 3 || frame_count % 300 == 0 {
-                    crate::logger::log(&format!(
-                        "video: decoded frame #{frame_count} ({}x{}) {}",
-                        frame.width,
-                        frame.height,
-                        frame_stats(&frame)
-                    ));
-                }
                 if let Ok(mut g) = shared.lock() {
                     g.status = Status::Ok;
                     g.version += 1;
@@ -213,28 +216,21 @@ fn run_loop(
                 thread::sleep(dur);
             }
             Next::EndOfStream => {
-                crate::logger::log("video: end of stream (looping)");
                 reader = None; // recreate below to loop the source
             }
             Next::Again => {
-                again_count += 1;
-                if again_count == 1 || again_count % 300 == 0 {
-                    crate::logger::log(&format!("video: no sample yet (skipped {again_count})"));
-                }
                 thread::sleep(THROTTLE);
             }
-            Next::Error => {
-                crate::logger::log("video: decode error (codec unavailable or malformed file)");
-                mark_failed(&shared, "decode error (codec unavailable or malformed file)".into());
+            Next::Error(reason) => {
+                mark_failed(&shared, reason.clone());
                 break;
             }
         }
 
         if reader.is_none() && !stop.load(Ordering::SeqCst) {
-            match Reader::new(&path, target) {
+            match Reader::new(&path, target, gpu.clone()) {
                 Ok(r) => reader = Some(r),
                 Err(e) => {
-                    crate::logger::log(&format!("video: reopen failed: {e}"));
                     mark_failed(&shared, e);
                     break;
                 }
@@ -243,41 +239,14 @@ fn run_loop(
         }
     }
 
-    crate::logger::log(&format!("video: decode loop exited after {frame_count} frames"));
     let _ = unsafe { CoUninitialize() };
-}
-
-fn fmt_name(f: PixelFormat) -> &'static str {
-    match f {
-        PixelFormat::Rgb24 => "RGB24",
-        PixelFormat::Yuy2 => "YUY2",
-        PixelFormat::Nv12 => "NV12",
-    }
-}
-
-/// Average R/G/B of a frame — used to verify the colour conversion is sane
-/// (a pure-green or black frame is a decoding bug, not real video content).
-fn frame_stats(r: &Raster) -> String {
-    let n = (r.width * r.height).max(1) as f64;
-    let (mut sr, mut sg, mut sb) = (0f64, 0f64, 0f64);
-    for px in r.bgra.chunks_exact(4) {
-        sb += px[0] as f64; // B
-        sg += px[1] as f64; // G
-        sr += px[2] as f64; // R
-    }
-    format!(
-        "[mean R={:.0} G={:.0} B={:.0}]",
-        sr / n,
-        sg / n,
-        sb / n
-    )
 }
 
 enum Next {
     Frame(Raster),
     EndOfStream,
     Again,
-    Error,
+    Error(String),
 }
 
 /// A single open source reader wrapped with our decoding helpers.
@@ -290,6 +259,8 @@ struct Reader {
     fmt: PixelFormat,
     /// Output size to convert into (monitor resolution), if provided.
     target: Option<(u32, u32)>,
+    /// GPU pipeline for hardware decode; `None` = software decode.
+    gpu: Option<Arc<crate::gpu::Gpu>>,
 }
 
 /// The uncompressed pixel format the Source Reader delivers.
@@ -301,8 +272,13 @@ enum PixelFormat {
 }
 
 impl Reader {
-    fn new(path: &Path, target: Option<(u32, u32)>) -> Result<Reader, String> {
-        let (source, stream_index, width, height, fmt) = unsafe { init_reader(path) }?;
+    fn new(
+        path: &Path,
+        target: Option<(u32, u32)>,
+        gpu: Option<Arc<crate::gpu::Gpu>>,
+    ) -> Result<Reader, String> {
+        let (source, stream_index, width, height, fmt) =
+            unsafe { init_reader(path, gpu.as_deref()) }?;
         Ok(Reader {
             source,
             stream_index,
@@ -311,6 +287,7 @@ impl Reader {
             frame_dur: DEFAULT_FRAME_DUR,
             fmt,
             target,
+            gpu,
         })
     }
 
@@ -329,12 +306,12 @@ impl Reader {
                 Some(&mut sample),
             );
             if result.is_err() {
-                return Next::Error;
+                return Next::Error(format!("ReadSample failed: {}", result.unwrap_err()));
             }
 
             let flags = stream_flags as i32;
             if (flags & MF_SOURCE_READERF_ERROR.0) != 0 {
-                return Next::Error;
+                return Next::Error("media stream error".into());
             }
             if (flags & MF_SOURCE_READERF_ENDOFSTREAM.0) != 0 {
                 return Next::EndOfStream;
@@ -353,36 +330,46 @@ impl Reader {
                 self.frame_dur = dur;
             }
 
-            match {
-                let t0 = std::time::Instant::now();
-                let res =
-                    decode_sample(&sample, self.width, self.height, self.fmt, self.target);
-                let ms = t0.elapsed().as_millis();
-                static TIMED: AtomicBool = AtomicBool::new(false);
-                if !TIMED.swap(true, Ordering::SeqCst) {
-                    crate::logger::log(&format!("video: frame decode took {ms} ms"));
-                }
-                res
-            } {
+            match decode_sample(
+                &sample,
+                self.width,
+                self.height,
+                self.fmt,
+                self.target,
+                self.gpu.as_deref(),
+            ) {
                 Ok(raster) => Next::Frame(raster),
-                Err(_) => Next::Error,
+                Err(e) => Next::Error(e),
             }
         }
     }
 }
 
 /// Open a source reader for `path`, select its first video stream and request a
-/// **decoded** output format. We deliberately avoid the RGB32 / advanced-video-
-/// processing path (which can stall), preferring formats the decoder produces
-/// natively (NV12/YUY2), converted to BGRA in software.
-unsafe fn init_reader(path: &Path) -> Result<(IMFSourceReader, u32, u32, u32, PixelFormat), String> { unsafe {
+/// **decoded** output format. With a GPU attached the reader is given a DXGI
+/// device manager so the decoder runs on the video engine; otherwise the CPU
+/// decoder is used and NV12/YUY2 is converted to BGRA in software.
+unsafe fn init_reader(
+    path: &Path,
+    gpu: Option<&crate::gpu::Gpu>,
+) -> Result<(IMFSourceReader, u32, u32, u32, PixelFormat), String> { unsafe {
     let url: Vec<u16> = path
         .to_string_lossy()
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
 
-    let reader = MFCreateSourceReaderFromURL(windows::core::PCWSTR(url.as_ptr()), None)
+    // With a GPU present, attach the DXGI device manager so the H.264 decoder
+    // runs on the video engine (hardware) instead of the CPU.
+    let mut attrs: Option<windows::Win32::Media::MediaFoundation::IMFAttributes> = None;
+    windows::Win32::Media::MediaFoundation::MFCreateAttributes(&mut attrs, 2)
+        .map_err(|e| format!("create attributes failed: {e}"))?;
+    let attrs = attrs.ok_or("create attributes failed".to_string())?;
+    if let Some(gpu) = gpu {
+        gpu.attach_to(&attrs)?;
+    }
+
+    let reader = MFCreateSourceReaderFromURL(windows::core::PCWSTR(url.as_ptr()), Some(&attrs))
         .map_err(|e| format!("open media source failed: {e}"))?;
 
     // Find the first video stream.
@@ -449,10 +436,10 @@ unsafe fn build_output_type(packed_size: u64, subtype: GUID) -> Result<IMFMediaT
 
 /// Convert a decoded media sample into a top-down BGRA raster.
 ///
-/// The sample's 2D surface is copied into an owned, packed buffer with
-/// `ContiguousCopyTo` (scanlines packed to the frame width — no pitch padding),
-/// so `pitch == width` is correct and there is no possibility of reading past
-/// the buffer. Media Foundation surfaces are top-down.
+/// With a GPU attached the decoded NV12 surface never touches CPU memory until
+/// after the video processor has converted it to BGRA on the GPU — only the
+/// finished frame is copied back. Without one, the sample's packed surface is
+/// converted in software.
 ///
 /// When `target` differs from the source size, frames are converted straight
 /// into that size (nearest sampling) so we never convert or blit more pixels
@@ -463,34 +450,47 @@ unsafe fn decode_sample(
     height: u32,
     fmt: PixelFormat,
     target: Option<(u32, u32)>,
-) -> Result<Raster, ()> { unsafe {
+    gpu: Option<&crate::gpu::Gpu>,
+) -> Result<Raster, String> { unsafe {
     let (w, h) = (width as usize, height as usize);
-    if sample.GetBufferCount().unwrap_or(0) == 0 {
-        return Err(());
-    }
-    let buffer = sample.GetBufferByIndex(0).map_err(|_| ())?;
-    let two_d = buffer.cast::<IMF2DBuffer>().map_err(|_| ())?;
-    let packed_len = two_d.GetContiguousLength().map_err(|_| ())? as usize;
-    let mut packed = vec![0u8; packed_len];
-    two_d.ContiguousCopyTo(&mut packed).map_err(|_| ())?;
-
-    // One-shot diagnostics: is the buffer big enough for NV12 (w*h*1.5)?
-    static DIAG: AtomicBool = AtomicBool::new(false);
-    if !DIAG.swap(true, Ordering::SeqCst) {
-        crate::logger::log(&format!(
-            "video: nv12 buffer len={packed_len} expected={} (y={}, uv={})",
-            w * h * 3 / 2,
-            w * h,
-            w * h / 2
-        ));
-    }
 
     // Output size: the requested monitor size, clamped to the source (never
-    // upscale — it wastes CPU and adds nothing for a wallpaper).
+    // upscale: it wastes CPU and adds nothing for a wallpaper).
     let (out_w, out_h) = match target {
         Some((tw, th)) if tw > 0 && th > 0 => ((tw as usize).min(w), (th as usize).min(h)),
         _ => (w, h),
     };
+
+    // GPU path: hardware decode + video-processor colour conversion.
+    if let Some(gpu) = gpu {
+        if fmt == PixelFormat::Nv12 {
+            let bgra = gpu
+                .nv12_sample_to_bgra(sample, out_w, out_h)
+                .map_err(|e| format!("gpu: {e}"))?;
+            return Ok(Raster {
+                width: out_w,
+                height: out_h,
+                bgra,
+            });
+        }
+        // Non-NV12 with GPU present: fall through to software conversion.
+    }
+
+    if sample.GetBufferCount().unwrap_or(0) == 0 {
+        return Err("sample has no buffers".into());
+    }
+    let buffer = sample.GetBufferByIndex(0).map_err(|_| "no sample buffer".to_string())?;
+    let two_d = buffer
+        .cast::<IMF2DBuffer>()
+        .map_err(|_| "not a 2d buffer".to_string())?;
+    let packed_len = two_d
+        .GetContiguousLength()
+        .map_err(|e| format!("contiguous length failed: {e}"))? as usize;
+    let mut packed = vec![0u8; packed_len];
+    two_d
+        .ContiguousCopyTo(&mut packed)
+        .map_err(|_| "surface copy failed".to_string())?;
+
     let dst_row = out_w * 4;
     let mut dst = vec![0u8; dst_row * out_h];
 

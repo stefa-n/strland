@@ -18,6 +18,7 @@
 #![windows_subsystem = "windows"]
 
 mod desktop;
+mod gpu;
 mod logger;
 mod render;
 mod storage;
@@ -86,7 +87,6 @@ fn main() {
     }
 
     let dir = storage::wallpaper_dir();
-    logger::start(&storage::display_dir(&dir));
 
     let watcher = match WallpaperWatcher::new(&dir) {
         Ok(w) => Watcher::Live(w),
@@ -109,6 +109,7 @@ fn main() {
         origin: (0, 0),
         painted_once: false,
         painted_version: 0,
+        video_path: None,
     };
 
     run_message_loop(&mut app);
@@ -135,6 +136,8 @@ struct App {
     painted_once: bool,
     /// Version of the last video frame we painted (skip redundant repaints).
     painted_version: u64,
+    /// Path of the currently loaded video, for GPU→software fallback.
+    video_path: Option<PathBuf>,
 }
 
 enum Watcher {
@@ -176,6 +179,20 @@ impl App {
             Some(candidate) => {
                 let target = self.target_size();
                 self.frame_start = Instant::now();
+                let ext_is_video = candidate
+                    .path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| {
+                        let e = e.to_ascii_lowercase();
+                        e == "mp4" || e == "webm"
+                    })
+                    .unwrap_or(false);
+                if ext_is_video {
+                    self.video_path = Some(candidate.path.clone());
+                } else {
+                    self.video_path = None;
+                }
                 self.wallpaper = load_wallpaper(&candidate, target);
                 self.painted_version = 0;
                 self.motion = self
@@ -247,26 +264,53 @@ impl App {
             self.reload();
         }
 
-        // If the media could not be decoded (or stalled with no frames), treat
-        // it as absent and reveal the desktop instead of freezing on grey.
-        let (video_failed, reason, stalled) = match self.wallpaper.as_ref() {
+        // If the media could not be decoded (or stalled with no frames), fall
+        // back: a GPU-mode player retries in software; software failure hides
+        // the wallpaper so the desktop shows instead of freezing on grey.
+        let (video_failed, reason, stalled, is_hw) = match self.wallpaper.as_ref() {
             Some(Wallpaper::Video(v)) => (
                 v.is_failed(),
                 v.failure_reason(),
                 !v.has_yielded() && v.active_secs() > VIDEO_TIMEOUT_SECS,
+                v.is_hw(),
             ),
-            _ => (false, None, false),
+            _ => (false, None, false, false),
+        };
+        let stall_reason = if stalled && reason.is_none() {
+            Some(format!("no frames within {VIDEO_TIMEOUT_SECS}s"))
+        } else {
+            None
         };
         if video_failed || stalled {
-            if stalled {
-                log(&format!(
-                    "video: no frames within {VIDEO_TIMEOUT_SECS}s (treating as failed)"
-                ));
-            }
-            if let Some(r) = reason {
+            if let Some(r) = reason.as_deref().or(stall_reason.as_deref()) {
                 log(&format!("video failed: {r}"));
             }
+            // A GPU-mode failure may be specific to hardware decode; retry the
+            // same file with the CPU decoder before giving up.
+            if is_hw {
+                if let Some(path) = self.video_path.clone() {
+                    log("video: retrying with software decode");
+                    let target = self.target_size();
+                    self.frame_start = Instant::now();
+                    self.painted_version = 0;
+                    self.wallpaper = video::VideoPlayer::open(&path, target, false)
+                        .map(Wallpaper::Video)
+                        .ok();
+                    self.motion = self
+                        .wallpaper
+                        .as_ref()
+                        .map(|w| needs_ticks(w))
+                        .unwrap_or(false);
+                    self.timer_ms = if self.motion { MOTION_MS } else { POLL_MS };
+                    if self.wallpaper.is_some() {
+                        self.show_window();
+                        self.invalidate();
+                        return;
+                    }
+                }
+            }
             self.wallpaper = None;
+            self.video_path = None;
             self.motion = false;
             self.timer_ms = POLL_MS;
             self.hide_window();
@@ -306,15 +350,7 @@ impl App {
             let hdc = BeginPaint(self.hwnd, &mut ps);
             if let Some(raster) = frame_at(wallpaper, self.frame_start.elapsed()) {
                 render::paint_frame(hdc, &self.monitors, self.origin, raster.as_ref());
-                if !self.painted_once {
-                    self.painted_once = true;
-                    log(&format!(
-                        "painted frame {}x{} over {} monitor(s)",
-                        raster.width,
-                        raster.height,
-                        self.monitors.len()
-                    ));
-                }
+                self.painted_once = true;
             } else {
                 render::paint_clear(hdc, &self.monitors, self.origin);
             }
@@ -476,6 +512,9 @@ unsafe extern "system" fn wnd_proc(
 }}
 
 /// Load a wallpaper file into a [`Wallpaper`], returning `None` on failure.
+///
+/// Videos are opened with GPU decoding first; if the GPU pipeline cannot even
+/// be set up, we fall back to software decoding immediately.
 fn load_wallpaper(candidate: &Candidate, target: Option<(u32, u32)>) -> Option<Wallpaper> {
     let path = &candidate.path;
     let ext = path
@@ -488,9 +527,15 @@ fn load_wallpaper(candidate: &Candidate, target: Option<(u32, u32)>) -> Option<W
         "gif" => decode_animated(path)
             .map(Wallpaper::Animated)
             .map_err(|e| format!("gif: {e}")),
-        "mp4" | "webm" => video::VideoPlayer::open(path, target)
-            .map(Wallpaper::Video)
-            .map_err(|e| format!("video: {e}")),
+        "mp4" | "webm" => match video::VideoPlayer::open(path, target, true) {
+            Ok(p) => Ok(Wallpaper::Video(p)),
+            Err(e) => {
+                log(&format!("GPU decode unavailable ({e}); using software decode"));
+                video::VideoPlayer::open(path, target, false)
+                    .map(Wallpaper::Video)
+                    .map_err(|e| format!("video: {e}"))
+            }
+        },
         "png" | "jpg" | "jpeg" | "bmp" => decode_still(path)
             .map(|r| Wallpaper::Still(Arc::new(r)))
             .map_err(|e| format!("image: {e}")),
@@ -498,10 +543,7 @@ fn load_wallpaper(candidate: &Candidate, target: Option<(u32, u32)>) -> Option<W
     };
 
     match result {
-        Ok(w) => {
-            log(&format!("loaded {}", path.display()));
-            Some(w)
-        }
+        Ok(w) => Some(w),
         Err(e) => {
             log(&format!("failed to load {} ({e})", path.display()));
             None

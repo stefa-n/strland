@@ -69,11 +69,6 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(format!("{drive}{path}"))
 }
 
-/// Return a human-readable form of the wallpaper directory for logging.
-pub fn display_dir(dir: &Path) -> String {
-    dir.display().to_string()
-}
-
 /// Scan the wallpaper directory for supported `wallpaper.*` files.
 ///
 /// This deliberately only looks for files whose file stem is exactly

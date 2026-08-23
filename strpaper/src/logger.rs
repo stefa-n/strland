@@ -22,9 +22,3 @@ pub fn log(msg: &str) {
         let _ = writeln!(f, "strpaper: {msg}");
     }
 }
-
-/// Record startup diagnostics once.
-pub fn start(dir: &str) {
-    log("======================================");
-    log(&format!("wallpaper directory: {dir}"));
-}
