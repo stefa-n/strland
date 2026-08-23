@@ -1037,23 +1037,39 @@ pub const POWER_ACTION_SHUTDOWN: u32 = 4;
 
 #[cfg(target_os = "windows")]
 pub fn perform_power_action(action: u32) -> bool {
-    use windows::Win32::System::Power::SetSuspendState;
-    use windows::Win32::System::Shutdown::{
-        ExitWindowsEx, LockWorkStation, EWX_LOGOFF, EWX_POWEROFF, EWX_REBOOT,
-        SHUTDOWN_REASON,
+    // Use the OS helper executables — the raw Win32 shutdown/lock APIs can be
+    // finicky about permissions (e.g. foreground-lock), so shelling out is more
+    // reliable.
+    let mut cmd = match action {
+        POWER_ACTION_LOCK => {
+            let mut c = std::process::Command::new("rundll32.exe");
+            c.args(["user32.dll,LockWorkStation"]);
+            c
+        }
+        POWER_ACTION_SUSPEND => {
+            let mut c = std::process::Command::new("rundll32.exe");
+            c.args(["powrprof.dll,SetSuspendState", "0", "1", "0"]);
+            c
+        }
+        POWER_ACTION_LOGOUT => {
+            let mut c = std::process::Command::new("shutdown.exe");
+            c.args(["/l"]);
+            c
+        }
+        POWER_ACTION_REBOOT => {
+            let mut c = std::process::Command::new("shutdown.exe");
+            c.args(["/r", "/t", "0"]);
+            c
+        }
+        POWER_ACTION_SHUTDOWN => {
+            let mut c = std::process::Command::new("shutdown.exe");
+            c.args(["/s", "/t", "0"]);
+            c
+        }
+        _ => return false,
     };
 
-    unsafe {
-        let reason = SHUTDOWN_REASON(0);
-        match action {
-            POWER_ACTION_LOCK => LockWorkStation().is_ok(),
-            POWER_ACTION_SUSPEND => SetSuspendState(false, true, false).as_bool(),
-            POWER_ACTION_LOGOUT => ExitWindowsEx(EWX_LOGOFF, reason).is_ok(),
-            POWER_ACTION_REBOOT => ExitWindowsEx(EWX_REBOOT, reason).is_ok(),
-            POWER_ACTION_SHUTDOWN => ExitWindowsEx(EWX_POWEROFF, reason).is_ok(),
-            _ => false,
-        }
-    }
+    cmd.spawn().is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2217,6 +2233,8 @@ pub fn activate_switch_window(hwnd_isize: isize) {
         ASFW_ANY,
     };
     unsafe {
+        // Allow any process to take foreground so SetForegroundWindow isn't
+        // blocked by the foreground lock.
         let _ = AllowSetForegroundWindow(ASFW_ANY);
         let hwnd = windows::Win32::Foundation::HWND(hwnd_isize as *mut core::ffi::c_void);
         let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -2235,7 +2253,14 @@ pub fn activate_switch_window(hwnd_isize: isize) {
         }
 
         let _ = BringWindowToTop(hwnd);
-        let _ = SetForegroundWindow(hwnd);
+        // Call it, and retry once — the first call can "warm up" foreground
+        // permission (matching what a real click grants).
+        let mut ok = SetForegroundWindow(hwnd);
+        if ok.0 == 0 {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+            ok = SetForegroundWindow(hwnd);
+        }
+        let _ = ok;
 
         if attached {
             let _ = AttachThreadInput(our_thread, target_thread, 0);

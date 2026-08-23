@@ -18,6 +18,7 @@
 #![windows_subsystem = "windows"]
 
 mod desktop;
+mod logger;
 mod render;
 mod storage;
 mod video;
@@ -25,9 +26,11 @@ mod watch;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use desktop::Monitor;
+use logger::log;
 use render::{Wallpaper, decode_animated, decode_still, frame_at, needs_ticks};
 use storage::Candidate;
 use watch::WallpaperWatcher;
@@ -44,11 +47,11 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, SetParent,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, GWLP_USERDATA,
-    HWND_BOTTOM, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_PAINT,
-    WM_TIMER, WNDCLASSW,
+    GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW, KillTimer, LoadCursorW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, GWLP_USERDATA, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
+    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_ERASEBKGND, WM_PAINT, WM_TIMER, WNDCLASSW,
 };
 
 /// Timer identifier.
@@ -66,6 +69,10 @@ const POLL_MS: u32 = 250;
 /// written file.
 const SETTLE_MS: u64 = 200;
 
+/// If a video has not produced its first frame within this many seconds it is
+/// treated as stalled and the desktop is revealed (instead of a grey frame).
+const VIDEO_TIMEOUT_SECS: f64 = 5.0;
+
 /// The wallpaper window handle, published for the console-ctrl handler.
 static WALLPAPER_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -75,16 +82,16 @@ fn main() {
     }
 
     if let Err(e) = video::startup() {
-        eprintln!("strpaper: Media Foundation unavailable: {e}");
+        log(&format!("Media Foundation unavailable: {e}"));
     }
 
     let dir = storage::wallpaper_dir();
-    eprintln!("strpaper: wallpaper directory: {}", storage::display_dir(&dir));
+    logger::start(&storage::display_dir(&dir));
 
     let watcher = match WallpaperWatcher::new(&dir) {
         Ok(w) => Watcher::Live(w),
         Err(e) => {
-            eprintln!("strpaper: file watching disabled: {e}");
+            log(&format!("file watching disabled: {e}"));
             Watcher::Poll
         }
     };
@@ -100,10 +107,14 @@ fn main() {
         timer_ms: POLL_MS,
         monitors: Vec::new(),
         origin: (0, 0),
+        painted_once: false,
+        painted_version: 0,
     };
 
     run_message_loop(&mut app);
 
+    // Drop the app (joins the video decode thread) before shutting down MF.
+    drop(app);
     video::shutdown();
 }
 
@@ -121,6 +132,9 @@ struct App {
     timer_ms: u32,
     monitors: Vec<Monitor>,
     origin: (i32, i32),
+    painted_once: bool,
+    /// Version of the last video frame we painted (skip redundant repaints).
+    painted_version: u64,
 }
 
 enum Watcher {
@@ -160,8 +174,10 @@ impl App {
         let mut candidates = storage::list_candidates(&self.dir);
         match storage::choose_primary(&mut candidates) {
             Some(candidate) => {
+                let target = self.target_size();
                 self.frame_start = Instant::now();
-                self.wallpaper = load_wallpaper(&candidate);
+                self.wallpaper = load_wallpaper(&candidate, target);
+                self.painted_version = 0;
                 self.motion = self
                     .wallpaper
                     .as_ref()
@@ -183,6 +199,20 @@ impl App {
         }
         // Repaint once with the new wallpaper (so a just-loaded image shows).
         self.invalidate();
+    }
+
+    /// The size videos should be decoded into — the desktop's bounding box, so
+    /// we never convert or blit more pixels than are actually shown.
+    fn target_size(&self) -> Option<(u32, u32)> {
+        if self.monitors.is_empty() {
+            return None;
+        }
+        let (_x, _y, w, h) = desktop::bounds(&self.monitors);
+        if w > 0 && h > 0 {
+            Some((w as u32, h as u32))
+        } else {
+            None
+        }
     }
 
     fn show_window(&self) {
@@ -216,9 +246,44 @@ impl App {
             self.wallpaper = None;
             self.reload();
         }
-        // Animation / video: redraw the current frame.
+
+        // If the media could not be decoded (or stalled with no frames), treat
+        // it as absent and reveal the desktop instead of freezing on grey.
+        let (video_failed, reason, stalled) = match self.wallpaper.as_ref() {
+            Some(Wallpaper::Video(v)) => (
+                v.is_failed(),
+                v.failure_reason(),
+                !v.has_yielded() && v.active_secs() > VIDEO_TIMEOUT_SECS,
+            ),
+            _ => (false, None, false),
+        };
+        if video_failed || stalled {
+            if stalled {
+                log(&format!(
+                    "video: no frames within {VIDEO_TIMEOUT_SECS}s (treating as failed)"
+                ));
+            }
+            if let Some(r) = reason {
+                log(&format!("video failed: {r}"));
+            }
+            self.wallpaper = None;
+            self.motion = false;
+            self.timer_ms = POLL_MS;
+            self.hide_window();
+        }
+
+        // Animation / video: redraw only when there is something new to show.
         if self.motion {
-            self.invalidate();
+            match self.wallpaper.as_ref() {
+                Some(Wallpaper::Video(v)) => {
+                    let version = v.version();
+                    if version != self.painted_version {
+                        self.painted_version = version;
+                        self.invalidate();
+                    }
+                }
+                _ => self.invalidate(), // GIF: always advance
+            }
         }
     }
 
@@ -240,7 +305,16 @@ impl App {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
             if let Some(raster) = frame_at(wallpaper, self.frame_start.elapsed()) {
-                render::paint_frame(hdc, &self.monitors, self.origin, raster);
+                render::paint_frame(hdc, &self.monitors, self.origin, raster.as_ref());
+                if !self.painted_once {
+                    self.painted_once = true;
+                    log(&format!(
+                        "painted frame {}x{} over {} monitor(s)",
+                        raster.width,
+                        raster.height,
+                        self.monitors.len()
+                    ));
+                }
             } else {
                 render::paint_clear(hdc, &self.monitors, self.origin);
             }
@@ -266,6 +340,8 @@ fn run_message_loop(app: &mut App) {
             lpfnWndProc: Some(wnd_proc),
             hInstance: windows::Win32::Foundation::HINSTANCE(hinstance.0),
             lpszClassName: class_name,
+            // Without this the desktop shows a busy cursor when hovered.
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             ..Default::default()
         };
         if RegisterClassW(&wc) == 0 {
@@ -400,7 +476,7 @@ unsafe extern "system" fn wnd_proc(
 }}
 
 /// Load a wallpaper file into a [`Wallpaper`], returning `None` on failure.
-fn load_wallpaper(candidate: &Candidate) -> Option<Wallpaper> {
+fn load_wallpaper(candidate: &Candidate, target: Option<(u32, u32)>) -> Option<Wallpaper> {
     let path = &candidate.path;
     let ext = path
         .extension()
@@ -412,22 +488,22 @@ fn load_wallpaper(candidate: &Candidate) -> Option<Wallpaper> {
         "gif" => decode_animated(path)
             .map(Wallpaper::Animated)
             .map_err(|e| format!("gif: {e}")),
-        "mp4" | "webm" => video::VideoPlayer::open(path)
+        "mp4" | "webm" => video::VideoPlayer::open(path, target)
             .map(Wallpaper::Video)
             .map_err(|e| format!("video: {e}")),
         "png" | "jpg" | "jpeg" | "bmp" => decode_still(path)
-            .map(Wallpaper::Still)
+            .map(|r| Wallpaper::Still(Arc::new(r)))
             .map_err(|e| format!("image: {e}")),
         other => Err(format!("unsupported extension: {other}")),
     };
 
     match result {
         Ok(w) => {
-            eprintln!("strpaper: loaded {}", path.display());
+            log(&format!("loaded {}", path.display()));
             Some(w)
         }
         Err(e) => {
-            eprintln!("strpaper: failed to load {} ({e})", path.display());
+            log(&format!("failed to load {} ({e})", path.display()));
             None
         }
     }

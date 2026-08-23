@@ -10,6 +10,7 @@
 //! window origin, which is passed as `origin`.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use image::codecs::gif::GifDecoder;
@@ -59,7 +60,7 @@ impl Raster {
 /// A single frame of an animated wallpaper (e.g. GIF).
 #[derive(Clone)]
 pub struct AnimatedFrame {
-    pub raster: Raster,
+    pub raster: Arc<Raster>,
     pub delay: Duration,
 }
 
@@ -71,7 +72,7 @@ pub struct Animated {
 
 /// A fully-decoded wallpaper source ready to be painted.
 pub enum Wallpaper {
-    Still(Raster),
+    Still(Arc<Raster>),
     Animated(Animated),
     Video(crate::video::VideoPlayer),
 }
@@ -83,11 +84,13 @@ pub fn needs_ticks(w: &Wallpaper) -> bool {
 }
 
 /// Select the raster that should be on screen at `elapsed` since playback
-/// started. Returns `None` when nothing is available to paint.
-pub fn frame_at(w: &mut Wallpaper, elapsed: Duration) -> Option<&Raster> {
+/// started. The returned `Arc` keeps the frame buffer alive while it is being
+/// painted, even if a new frame replaces it concurrently. Returns `None` when
+/// nothing is available to paint.
+pub fn frame_at(w: &mut Wallpaper, elapsed: Duration) -> Option<Arc<Raster>> {
     match w {
-        Wallpaper::Still(r) => Some(r),
-        Wallpaper::Animated(a) => gif_frame_at(a, elapsed),
+        Wallpaper::Still(r) => Some(r.clone()),
+        Wallpaper::Animated(a) => gif_frame_at(a, elapsed).cloned(),
         Wallpaper::Video(v) => v.frame_at(elapsed),
     }
 }
@@ -118,7 +121,7 @@ pub fn decode_animated(path: &Path) -> Result<Animated, String> {
         let img = frame.buffer().to_owned();
         let (w, h) = (img.width() as usize, img.height() as usize);
         frames.push(AnimatedFrame {
-            raster: Raster::from_rgba(&img.into_raw(), w, h),
+            raster: Arc::new(Raster::from_rgba(&img.into_raw(), w, h)),
             delay,
         });
     }
@@ -131,7 +134,7 @@ pub fn decode_animated(path: &Path) -> Result<Animated, String> {
 
 /// Select the GIF frame whose time window contains `elapsed`, looping around
 /// the animation timeline.
-fn gif_frame_at(a: &Animated, elapsed: Duration) -> Option<&Raster> {
+fn gif_frame_at(a: &Animated, elapsed: Duration) -> Option<&Arc<Raster>> {
     if a.frames.is_empty() {
         return None;
     }

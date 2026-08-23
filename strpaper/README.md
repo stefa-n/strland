@@ -116,7 +116,15 @@ The binary is `strpaper.exe` (built for the host target). Cross-build with
   no Alt+Tab entry.
 - **Shutdown**: a console control handler makes `Ctrl+C` / `Ctrl+Break` and a
   console close shut the process down gracefully.
+- **Video**: MP4/WebM are decoded with Windows Media Foundation **on a
+  background thread**, so the UI thread is never blocked (no frozen wallpaper /
+  busy cursor). Each decoded frame is published as a shared buffer and blitted
+  by the UI thread. If the media cannot be decoded, the wallpaper window is
+  hidden, the desktop is revealed, and the reason is written to the log.
 - **Threading**: a small repaint timer plus a separate watcher detect
   filesystem changes.
+- **Logging**: diagnostics are appended to `%USERPROFILE%\.strland\strpaper.log`
+  (the app has no console). The log sits **outside** the watched `strpaper`
+  directory so writing to it never re-triggers a wallpaper reload.
 - **Resource usage**: static wallpapers only repaint when needed; only animated
   and video wallpapers spin a ~24-30 fps timer.

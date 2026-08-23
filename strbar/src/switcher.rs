@@ -65,10 +65,10 @@ impl SwitcherState {
         cfg: &Config,
         accent: egui::Color32,
         alpha: f32,
-    ) {
+    ) -> Option<usize> {
         let n = self.windows.len();
         if n == 0 || alpha <= 0.01 {
-            return;
+            return None;
         }
         let a = (alpha * 255.0).round() as u8;
         let bg = Config::parse_color(&cfg.background);
@@ -129,10 +129,19 @@ impl SwitcherState {
                 );
             }
 
+            let mut act_on_click = None;
             if resp.clicked() {
                 self.index = i;
+                // Double-click switches to the app immediately.
+                if resp.double_clicked() {
+                    act_on_click = Some(i);
+                }
+            }
+            if let Some(sel) = act_on_click {
+                return Some(sel);
             }
         }
+        None
     }
 }
 

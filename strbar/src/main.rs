@@ -827,10 +827,14 @@ impl eframe::App for DynamicIslandApp {
                 }
             }
         }
-        // Alt released while switching → focus the selected app. Checked
-        // independently of the Alt-down branch so a fast release can't be missed.
-        if self.switcher.active && win::take_alt_released(500) {
-            self.switcher.activate_selected();
+        // Alt released while switching → focus the selected app. Fires when the
+        // Alt-up is reported, OR simply when Alt is no longer down while the
+        // switcher is showing (covers a missed timestamp).
+        if self.switcher.active {
+            let released = win::take_alt_released(500) || !win::switcher_alt_down();
+            if released {
+                self.switcher.activate_selected();
+            }
         }
         if !win::switcher_alt_down() {
             self.last_switcher_tab = 0;
@@ -1334,13 +1338,20 @@ impl eframe::App for DynamicIslandApp {
             );
             let sw_rect = lerp_rect(start, target, se);
             let accent = Config::parse_color(&self.cfg.accent_color);
+            let mut double_clicked: Option<usize> = None;
             egui::Area::new(egui::Id::new("app_switcher"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(sw_rect.min)
                 .movable(false)
                 .show(ctx, |ui| {
-                    self.switcher.draw(ui, sw_rect, &self.cfg, accent, se);
+                    if let Some(sel) = self.switcher.draw(ui, sw_rect, &self.cfg, accent, se) {
+                        double_clicked = Some(sel);
+                    }
                 });
+            if let Some(sel) = double_clicked {
+                self.switcher.index = sel;
+                self.switcher.activate_selected();
+            }
         }
 
         // --- Repaint scheduling ---
