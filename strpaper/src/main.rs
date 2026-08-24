@@ -25,15 +25,14 @@ mod storage;
 mod video;
 mod watch;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use desktop::Monitor;
 use logger::log;
 use render::{Wallpaper, decode_animated, decode_still, frame_at, needs_ticks};
-use storage::Candidate;
 use watch::WallpaperWatcher;
 
 use windows::core::w;
@@ -110,6 +109,13 @@ fn main() {
         painted_once: false,
         painted_version: 0,
         video_path: None,
+        render_paused: false,
+        loaded_source: None,
+        config_name: None,
+        media_cache: None,
+        transcoded_cache: None,
+        transcode_rx: None,
+        transcode_generation: 0,
     };
 
     run_message_loop(&mut app);
@@ -136,8 +142,37 @@ struct App {
     painted_once: bool,
     /// Version of the last video frame we painted (skip redundant repaints).
     painted_version: u64,
-    /// Path of the currently loaded video, for GPU→software fallback.
+    /// Path of the currently loaded video, for GPU->software fallback.
     video_path: Option<PathBuf>,
+    /// Rendering is suspended (maximized/fullscreen app covering the desktop).
+    render_paused: bool,
+    /// What is currently loaded, so unchanged files are never re-read.
+    loaded_source: Option<(PathBuf, Option<SystemTime>)>,
+    /// Last-read wallpaper name from the config file.
+    config_name: Option<String>,
+    /// Most recent media file kept in RAM so switching wallpapers does not
+    /// re-read from disk.
+    media_cache: Option<(PathBuf, SystemTime, Arc<Vec<u8>>)>,
+    /// Pre-scaled re-encodes kept in RAM, keyed by source + output height.
+    transcoded_cache: Option<((PathBuf, Option<SystemTime>, u32), Arc<Vec<u8>>)>,
+    /// Results from background pre-conversion jobs.
+    transcode_rx: Option<std::sync::mpsc::Receiver<TranscodeResult>>,
+    /// Bumped whenever a new job is spawned; stale results are dropped.
+    transcode_generation: u64,
+}
+
+/// A finished (or failed) background pre-conversion.
+enum TranscodeResult {
+    Done(u64, Vec<u8>),
+    Failed(u64, String),
+}
+
+impl TranscodeResult {
+    fn generation(&self) -> u64 {
+        match self {
+            TranscodeResult::Done(g, _) | TranscodeResult::Failed(g, _) => *g,
+        }
+    }
 }
 
 enum Watcher {
@@ -172,56 +207,181 @@ impl App {
         }
     }
 
-    /// Re-resolve the wallpaper file from the storage directory and load it.
+    /// Re-resolve the wallpaper from the config file + storage directory and
+    /// load it. Unchanged sources are skipped entirely (nothing is re-read).
     fn reload(&mut self) {
-        let mut candidates = storage::list_candidates(&self.dir);
-        match storage::choose_primary(&mut candidates) {
-            Some(candidate) => {
-                let target = self.target_size();
-                self.frame_start = Instant::now();
-                let ext_is_video = candidate
-                    .path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| {
-                        let e = e.to_ascii_lowercase();
-                        e == "mp4" || e == "webm"
-                    })
-                    .unwrap_or(false);
-                if ext_is_video {
-                    self.video_path = Some(candidate.path.clone());
-                } else {
-                    self.video_path = None;
-                }
-                self.wallpaper = load_wallpaper(&candidate, target);
-                self.painted_version = 0;
-                self.motion = self
-                    .wallpaper
-                    .as_ref()
-                    .map(|w| needs_ticks(w))
-                    .unwrap_or(false);
-                self.timer_ms = if self.motion { MOTION_MS } else { POLL_MS };
-                if self.wallpaper.is_some() {
-                    self.show_window();
+        // The optional `wallpaper = "..."` entry in the config file selects
+        // which file in the wallpaper directory to show.
+        self.config_name = storage::read_configured_name(&self.dir);
+        let Some(path) = storage::resolve_wallpaper_file(&self.dir, self.config_name.as_deref())
+        else {
+            // Nothing to display: hide and keep running.
+            self.wallpaper = None;
+            self.loaded_source = None;
+            self.motion = false;
+            self.timer_ms = POLL_MS;
+            self.hide_window();
+            self.invalidate();
+            return;
+        };
+
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+
+        // Already showing this exact file? Nothing to do — the wallpaper stays
+        // in memory and is not re-read or re-decoded.
+        if self.loaded_source.as_ref().is_some_and(|(p, m)| {
+            *p == path && *m == mtime && self.wallpaper.is_some()
+        }) {
+            return;
+        }
+
+        let target = self.target_size();
+        let ext_is_video = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "mp4" || e == "webm"
+            })
+            .unwrap_or(false);
+
+        if ext_is_video {
+            // Keep the media bytes cached so switching wallpapers does not
+            // re-read them from disk.
+            let Some((data, _)) = self.media_data(&path) else {
+                log(&format!("failed to read {}", path.display()));
+                self.wallpaper = None;
+                self.loaded_source = None;
+                self.hide_window();
+                self.invalidate();
+                return;
+            };
+            self.video_path = Some(path.clone());
+
+            // Optional pre-conversion: re-encode once to the configured height
+            // (in memory) so playback never has to chew through 4K frames.
+            let quality_height = storage::read_configured_quality(&self.dir);
+            if let Some(qh) = quality_height {
+                let (src_w, src_h) =
+                    video::VideoPlayer::probe_size(&data).unwrap_or((0, 0));
+                if src_w > 0 && src_h > 0 && qh < src_h {
+                    let out_h = (qh & !1).max(2);
+                    let out_w = (((src_w as u64 * out_h as u64) / src_h as u64) as u32 & !1).max(2);
+
+                    // Already converted for this file/size? Play it directly.
+                    if let Some((key, bytes)) = &self.transcoded_cache {
+                        if key.0 == path && key.1 == mtime && key.2 == out_h {
+                            return self.open_video(bytes.clone(), None);
+                        }
+                    }
+
+                    // Otherwise run the conversion in the background and keep
+                    // the current wallpaper visible until it is ready.
+                    self.transcode_generation += 1;
+                    let generation = self.transcode_generation;
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.transcode_rx = Some(rx);
+                    self.loaded_source = Some((path.clone(), mtime));
+                    std::thread::spawn(move || {
+                        let result = video::VideoPlayer::transcode(data, out_w, out_h);
+                        let _ = tx.send(match result {
+                            Ok(bytes) => TranscodeResult::Done(generation, bytes),
+                            Err(e) => TranscodeResult::Failed(generation, e),
+                        });
+                    });
+                    return;
                 }
             }
-            None => {
-                // No wallpaper present: hide the rendered wallpaper and keep
-                // running (a new wallpaper is picked up on the next change).
-                self.wallpaper = None;
-                self.motion = false;
-                self.timer_ms = POLL_MS;
-                self.hide_window();
+
+            self.frame_start = Instant::now();
+            self.painted_version = 0;
+            self.wallpaper =
+                load_video(&data, target).or_else(|| {
+                    log(&format!("failed to load {}", path.display()));
+                    None
+                });
+        } else {
+            self.video_path = None;
+            self.frame_start = Instant::now();
+            self.painted_version = 0;
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            self.wallpaper = if ext == "gif" {
+                decode_animated(&path)
+                    .map(Wallpaper::Animated)
+                    .map_err(|e| {
+                        log(&format!(
+                            "failed to load {} ({e:?})",
+                            path.display()
+                        ));
+                        e
+                    })
+                    .ok()
+            } else {
+                decode_still(&path)
+                    .map(|r| Wallpaper::Still(Arc::new(r)))
+                    .map_err(|e| {
+                        log(&format!("failed to load {} ({e:?})", path.display()));
+                        e
+                    })
+                    .ok()
+            };
+        }
+
+        // Log only when the active file actually changes (not on no-op
+        // reloads) so the log stays useful and quiet.
+        if self
+            .loaded_source
+            .as_ref()
+            .is_none_or(|(p, _)| *p != path)
+        {
+            match self.config_name.as_deref() {
+                Some(name) => log(&format!("wallpaper set to {name} (from config)")),
+                None => log(&format!("wallpaper set to {}", path.display())),
             }
         }
-        // Repaint once with the new wallpaper (so a just-loaded image shows).
+
+        self.loaded_source = self
+            .wallpaper
+            .as_ref()
+            .map(|_| (path.clone(), mtime));
+        self.motion = self
+            .wallpaper
+            .as_ref()
+            .map(|w| needs_ticks(w))
+            .unwrap_or(false);
+        self.timer_ms = if self.motion { MOTION_MS } else { POLL_MS };
+        if self.wallpaper.is_some() {
+            self.show_window();
+        }
+        // Repaint with the new wallpaper.
         self.invalidate();
+    }
+
+    /// Fetch the media bytes for `path`, preferring the in-RAM cache so the
+    /// disk is only touched when the file actually changed.
+    fn media_data(&mut self, path: &Path) -> Option<(Arc<Vec<u8>>, Option<SystemTime>)> {
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if let Some((_, _, bytes)) = self
+            .media_cache
+            .as_ref()
+            .filter(|(cp, cm, _)| *cp == path && Some(*cm) == mtime)
+        {
+            return Some((bytes.clone(), mtime));
+        }
+        let bytes = Arc::new(std::fs::read(path).ok()?);
+        if let Some(m) = mtime {
+            self.media_cache = Some((path.to_path_buf(), m, bytes.clone()));
+        }
+        Some((bytes, mtime))
     }
 
     /// The size videos should be decoded into — the desktop's bounding box, so
     /// we never convert or blit more pixels than are actually shown.
-    fn target_size(&self) -> Option<(u32, u32)> {
-        if self.monitors.is_empty() {
+    fn target_size(&self) -> Option<(u32, u32)> {        if self.monitors.is_empty() {
             return None;
         }
         let (_x, _y, w, h) = desktop::bounds(&self.monitors);
@@ -256,12 +416,129 @@ impl App {
         self.invalidate();
     }
 
+    /// Open a video player for pre-converted bytes (GPU first, SW fallback),
+    /// applying the current pause state.
+    fn open_video(&mut self, data: Arc<Vec<u8>>, target: Option<(u32, u32)>) {
+        self.frame_start = Instant::now();
+        self.painted_version = 0;
+        let player = match video::VideoPlayer::open(data.clone(), target, true) {
+            Ok(p) => p,
+            Err(e) => {
+                log(&format!("GPU decode unavailable ({e}); using software decode"));
+                match video::VideoPlayer::open(data, target, false) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log(&format!("video failed: {e}"));
+                        self.wallpaper = None;
+                        self.motion = false;
+                        self.timer_ms = POLL_MS;
+                        self.hide_window();
+                        return;
+                    }
+                }
+            }
+        };
+        let paused = self.render_paused;
+        player.set_paused(paused);
+        self.wallpaper = Some(Wallpaper::Video(player));
+        self.motion = true;
+        self.timer_ms = MOTION_MS;
+        if !paused {
+            self.invalidate();
+        }
+    }
+
+    /// Apply any finished background pre-conversion.
+    fn drain_transcodes(&mut self) {
+        let Some(rx) = &self.transcode_rx else {
+            return;
+        };
+        // Collect first so `self` can be mutated freely while applying.
+        let mut results = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            results.push(msg);
+        }
+        for msg in results {
+            let generation = msg.generation();
+            if generation != self.transcode_generation {
+                continue; // superseded by a newer config/file change
+            }
+            match msg {
+                TranscodeResult::Done(_, bytes) => {
+                    // Cache the conversion so restarts/switches are instant.
+                    if let (Some((p, m)), Some(qh)) =
+                        (self.loaded_source.as_ref(), storage::read_configured_quality(&self.dir))
+                    {
+                        let out_h = qh & !1;
+                        self.transcoded_cache =
+                            Some(((p.clone(), *m, out_h), Arc::new(bytes.clone())));
+                    }
+                    self.open_video(Arc::new(bytes), None);
+                }
+                TranscodeResult::Failed(_, e) => {
+                    log(&format!("pre-conversion failed ({e}); playing original"));
+                    if let Some(path) = self.video_path.clone() {
+                        if let Some((data, _)) = self.media_data(&path) {
+                            let target = self.target_size();
+                            self.frame_start = Instant::now();
+                            self.painted_version = 0;
+                            self.wallpaper = load_video(&data, target);
+                            self.motion = self
+                                .wallpaper
+                                .as_ref()
+                                .map(|w| needs_ticks(w))
+                                .unwrap_or(false);
+                            self.timer_ms = if self.motion { MOTION_MS } else { POLL_MS };
+                            if self.wallpaper.is_some() {
+                                self.show_window();
+                            }
+                            self.invalidate();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// One timer tick: pick up pending file changes and advance motion.
     fn tick(&mut self) {
+        // Apply finished pre-conversions (even while covered).
+        self.drain_transcodes();
+
+        // Pause rendering while the desktop is completely covered by a
+        // maximized/fullscreen application — nothing of it would be visible.
+        let covered = desktop::any_window_covers_desktop();
+        if covered != self.render_paused {
+            self.render_paused = covered;
+            if let Some(Wallpaper::Video(v)) = self.wallpaper.as_ref() {
+                v.set_paused(covered);
+            }
+            log(if covered {
+                "rendering paused (desktop fully covered)"
+            } else {
+                "rendering resumed"
+            });
+            if !covered {
+                // Repaint immediately on resume (frame may be stale).
+                self.painted_version = 0;
+                self.invalidate();
+            }
+        }
+
+        // Config / file changes are applied even while paused, so a wallpaper
+        // swap is already in place when the desktop becomes visible again.
         if self.watcher_is_dirty() {
             std::thread::sleep(Duration::from_millis(SETTLE_MS));
             self.wallpaper = None;
             self.reload();
+            if let Some(Wallpaper::Video(v)) = self.wallpaper.as_ref() {
+                v.set_paused(self.render_paused);
+            }
+        }
+
+        // Skip all painting work while covered.
+        if self.render_paused {
+            return;
         }
 
         // If the media could not be decoded (or stalled with no frames), fall
@@ -291,21 +568,23 @@ impl App {
                 if let Some(path) = self.video_path.clone() {
                     log("video: retrying with software decode");
                     let target = self.target_size();
-                    self.frame_start = Instant::now();
-                    self.painted_version = 0;
-                    self.wallpaper = video::VideoPlayer::open(&path, target, false)
-                        .map(Wallpaper::Video)
-                        .ok();
-                    self.motion = self
-                        .wallpaper
-                        .as_ref()
-                        .map(|w| needs_ticks(w))
-                        .unwrap_or(false);
-                    self.timer_ms = if self.motion { MOTION_MS } else { POLL_MS };
-                    if self.wallpaper.is_some() {
-                        self.show_window();
-                        self.invalidate();
-                        return;
+                    if let Some((data, _)) = self.media_data(&path) {
+                        self.frame_start = Instant::now();
+                        self.painted_version = 0;
+                        self.wallpaper = video::VideoPlayer::open(data, target, false)
+                            .map(Wallpaper::Video)
+                            .ok();
+                        self.motion = self
+                            .wallpaper
+                            .as_ref()
+                            .map(|w| needs_ticks(w))
+                            .unwrap_or(false);
+                        self.timer_ms = if self.motion { MOTION_MS } else { POLL_MS };
+                        if self.wallpaper.is_some() {
+                            self.show_window();
+                            self.invalidate();
+                            return;
+                        }
                     }
                 }
             }
@@ -381,7 +660,7 @@ fn run_message_loop(app: &mut App) {
             ..Default::default()
         };
         if RegisterClassW(&wc) == 0 {
-            eprintln!("strpaper: RegisterClassW failed");
+            log("RegisterClassW failed");
             return;
         }
 
@@ -511,42 +790,17 @@ unsafe extern "system" fn wnd_proc(
     }
 }}
 
-/// Load a wallpaper file into a [`Wallpaper`], returning `None` on failure.
-///
-/// Videos are opened with GPU decoding first; if the GPU pipeline cannot even
-/// be set up, we fall back to software decoding immediately.
-fn load_wallpaper(candidate: &Candidate, target: Option<(u32, u32)>) -> Option<Wallpaper> {
-    let path = &candidate.path;
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    let result = match ext.as_str() {
-        "gif" => decode_animated(path)
-            .map(Wallpaper::Animated)
-            .map_err(|e| format!("gif: {e}")),
-        "mp4" | "webm" => match video::VideoPlayer::open(path, target, true) {
-            Ok(p) => Ok(Wallpaper::Video(p)),
-            Err(e) => {
-                log(&format!("GPU decode unavailable ({e}); using software decode"));
-                video::VideoPlayer::open(path, target, false)
-                    .map(Wallpaper::Video)
-                    .map_err(|e| format!("video: {e}"))
-            }
-        },
-        "png" | "jpg" | "jpeg" | "bmp" => decode_still(path)
-            .map(|r| Wallpaper::Still(Arc::new(r)))
-            .map_err(|e| format!("image: {e}")),
-        other => Err(format!("unsupported extension: {other}")),
-    };
-
-    match result {
-        Ok(w) => Some(w),
+/// Open a video from an in-memory copy, GPU decoding first with automatic
+/// fallback to software if the GPU pipeline cannot be set up.
+fn load_video(data: &Arc<Vec<u8>>, target: Option<(u32, u32)>) -> Option<Wallpaper> {
+    match video::VideoPlayer::open(data.clone(), target, true) {
+        Ok(p) => Some(Wallpaper::Video(p)),
         Err(e) => {
-            log(&format!("failed to load {} ({e})", path.display()));
-            None
+            log(&format!("GPU decode unavailable ({e}); using software decode"));
+            video::VideoPlayer::open(data.clone(), target, false)
+                .map(Wallpaper::Video)
+                .map_err(|e| format!("video: {e}"))
+                .ok()
         }
     }
 }

@@ -774,9 +774,9 @@ static SUPER_KEY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[cfg(target_os = "windows")]
 static CONTROL_OPEN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(target_os = "windows")]
-static WIN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WALLPAPER_OPEN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(target_os = "windows")]
-static WIN_DOWN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WIN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static ALT_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "windows")]
@@ -790,6 +790,52 @@ static ESC_PRESSED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 #[cfg(target_os = "windows")]
 pub fn tick_ms() -> u64 {
     unsafe { GetTickCount64() }
+}
+
+/// Appends a line to %TEMP%\strland.log — debug output that works even without
+/// a console (the app has no console window in release builds).
+pub fn debug_log(msg: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("strland.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{stamp}] {msg}");
+    }
+}
+
+/// True if the mouse cursor is currently visible (games often hide it).
+#[cfg(target_os = "windows")]
+pub fn cursor_visible() -> bool {
+    #[repr(C)]
+    struct CursorInfo {
+        cb_size: u32,
+        flags: u32,
+        cursor: isize,
+        pt: POINT,
+    }
+    unsafe extern "system" {
+        fn GetCursorInfo(pci: *mut CursorInfo) -> i32;
+    }
+    let mut ci = CursorInfo {
+        cb_size: std::mem::size_of::<CursorInfo>() as u32,
+        flags: 0,
+        cursor: 0,
+        pt: POINT::default(),
+    };
+    unsafe {
+        if GetCursorInfo(&mut ci) != 0 {
+            return ci.flags & 1 != 0; // CURSOR_SHOWING
+        }
+    }
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn cursor_visible() -> bool {
+    true
 }
 
 /// True if the Super/Windows key (left or right) was pressed within `max_age_ms`.
@@ -819,6 +865,21 @@ pub fn take_control_open(max_age_ms: u64) -> bool {
         return false;
     }
     CONTROL_OPEN_MS.store(0, Ordering::Relaxed);
+    true
+}
+
+/// True if the wallpaper-panel shortcut (Win+W) was pressed within `max_age_ms`.
+#[cfg(target_os = "windows")]
+pub fn take_wallpaper_open(max_age_ms: u64) -> bool {
+    let stamp = WALLPAPER_OPEN_MS.load(Ordering::Relaxed);
+    if stamp == 0 {
+        return false;
+    }
+    if tick_ms().saturating_sub(stamp) > max_age_ms {
+        WALLPAPER_OPEN_MS.store(0, Ordering::Relaxed);
+        return false;
+    }
+    WALLPAPER_OPEN_MS.store(0, Ordering::Relaxed);
     true
 }
 
@@ -883,13 +944,15 @@ pub fn take_media_key_event(max_age_ms: u64) -> Option<u32> {
 }
 
 #[cfg(target_os = "windows")]
-fn shell_is_running() -> bool {
+pub fn shell_is_running() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
     unsafe { !GetShellWindow().is_invalid() }
 }
 
+/// Applies a media/volume key action ourselves (used when no shell is running
+/// to handle the key). Called from the UI thread — never inside the hook.
 #[cfg(target_os = "windows")]
-fn apply_media_key(kind: u32) -> bool {
+pub fn apply_media_key(kind: u32) -> bool {
     match kind {
         MEDIA_KEY_UP => cached_volume::step_volume(true),
         MEDIA_KEY_DOWN => cached_volume::step_volume(false),
@@ -915,6 +978,7 @@ pub fn start_media_key_hook() {
     const VK_LWIN: u32 = 0x5B;
     const VK_RWIN: u32 = 0x5C;
     const VK_A: u32 = 0x41;
+    const VK_W: u32 = 0x57;
     const VK_LMENU: u32 = 0xA4;
     const VK_RMENU: u32 = 0xA5;
     const VK_MENU: u32 = 0x12;
@@ -939,7 +1003,6 @@ pub fn start_media_key_hook() {
                     if kb.vkCode == VK_LWIN || kb.vkCode == VK_RWIN {
                         if wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN {
                             WIN_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
-                            WIN_DOWN_MS.store(tick_ms(), std::sync::atomic::Ordering::Relaxed);
                             SUPER_KEY_MS.store(tick_ms(), Ordering::Relaxed);
                         } else if wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP {
                             WIN_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -980,13 +1043,19 @@ pub fn start_media_key_hook() {
                     }
 
                     if wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN {
-                        // Win+A → open the control center. Only fire if the 'A'
-                        // arrives within a short window of the Win press so a bare
-                        // Win keypress can't combine with a later 'a' keystroke.
-                        let win_was_recent = WIN_DOWN.load(std::sync::atomic::Ordering::Relaxed)
-                            && tick_ms().saturating_sub(WIN_DOWN_MS.load(std::sync::atomic::Ordering::Relaxed)) < 500;
-                        if kb.vkCode == VK_A && win_was_recent {
+                        // Win+<key> combos — fire whenever the Win key is physically
+                        // held (WIN_DOWN), so holding Win and tapping a key works no
+                        // matter how long the Win key has been down.
+                        let win_held = WIN_DOWN.load(std::sync::atomic::Ordering::Relaxed);
+                        // Win+A → open the control center.
+                        if kb.vkCode == VK_A && win_held {
                             CONTROL_OPEN_MS.store(tick_ms(), Ordering::Relaxed);
+                            return LRESULT(1);
+                        }
+                        // Win+W → open the wallpaper panel.
+                        if kb.vkCode == VK_W && win_held {
+                            debug_log("[keys] Win+W detected");
+                            WALLPAPER_OPEN_MS.store(tick_ms(), Ordering::Relaxed);
                             return LRESULT(1);
                         }
                         let kind = match kb.vkCode {
@@ -996,11 +1065,18 @@ pub fn start_media_key_hook() {
                             _ => MEDIA_KEY_NONE,
                         };
                         if kind != MEDIA_KEY_NONE {
+                            debug_log(&format!(
+                                "[keys] media key vk={:#x} kind={} shell={}",
+                                kb.vkCode,
+                                kind,
+                                shell_is_running()
+                            ));
                             MEDIA_KEY_KIND.store(kind, Ordering::Relaxed);
                             MEDIA_KEY_MS.store(tick_ms(), Ordering::Relaxed);
                             if !shell_is_running() {
-                                // No shell to handle the key — apply it ourselves and swallow it.
-                                apply_media_key(kind);
+                                // No shell to handle the key — swallow it here; the main
+                                // thread applies the change (keeps this callback fast so
+                                // Windows doesn't silently remove the hook).
                                 return LRESULT(1);
                             }
                         }
@@ -1017,8 +1093,10 @@ pub fn start_media_key_hook() {
             let hook_proc: HOOKPROC = Some(ll_key_proc);
             let hook = SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc, HINSTANCE::default(), 0);
             if hook.is_err() {
+                debug_log("[keys] SetWindowsHookExW FAILED — media keys disabled");
                 return;
             }
+            debug_log("[keys] keyboard hook installed");
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
         })
@@ -1131,15 +1209,15 @@ pub fn start_notification_listener() {
             let listener = match UserNotificationListener::Current() {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("[notify] UserNotificationListener::Current failed: {e:?}");
+                    debug_log(&format!("[notify] UserNotificationListener::Current failed: {e:?}"));
                     return;
                 }
             };
 
             // Request access (needed to read notifications).
             match listener.RequestAccessAsync().and_then(|op| op.get()) {
-                Ok(status) => eprintln!("[notify] access status = {}", status.0),
-                Err(e) => eprintln!("[notify] RequestAccessAsync failed: {e:?}"),
+                Ok(status) => debug_log(&format!("[notify] access status = {}", status.0)),
+                Err(e) => debug_log(&format!("[notify] RequestAccessAsync failed: {e:?}")),
             }
 
             let mut known: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -1155,6 +1233,10 @@ pub fn start_notification_listener() {
                                 let id = info.id;
                                 if !known.contains(&id) {
                                     known.insert(id);
+                                    debug_log(&format!(
+                                        "[notify] NEW id={} app='{}' title='{}' body='{}'",
+                                        id, info.app, info.title, info.body
+                                    ));
                                     NEW_NOTIFICATION_MS.store(tick_ms(), Ordering::Relaxed);
                                     // Stash this specific notification so the UI can
                                     // read it without racing the stale full list.
@@ -1171,7 +1253,7 @@ pub fn start_notification_listener() {
                             *g = snapshot;
                         }
                     }
-                    Err(e) => eprintln!("[notify] GetNotificationsAsync failed: {e:?}"),
+                    Err(e) => debug_log(&format!("[notify] GetNotificationsAsync failed: {e:?}")),
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1000));
             }
@@ -1977,7 +2059,7 @@ pub struct WifiNetwork {
     pub ssid: String,
 }
 
-/// Returns the list of visible Wi-Fi networks for the first interface.
+/// Returns the list of visible Wi-Fi networks across all interfaces.
 #[cfg(target_os = "windows")]
 pub fn list_wifi_networks() -> Vec<WifiNetwork> {
     use windows::Win32::NetworkManagement::WiFi::{
@@ -1985,6 +2067,9 @@ pub fn list_wifi_networks() -> Vec<WifiNetwork> {
         WlanOpenHandle, WLAN_AVAILABLE_NETWORK_LIST, WLAN_INTERFACE_INFO_LIST,
     };
     const WLAN_CLIENT_VERSION: u32 = 2;
+    // WLAN_AVAILABLE_NETWORK_INCLUDE_ALL_ADHOC_PROFILES (0x1) |
+    // WLAN_AVAILABLE_NETWORK_INCLUDE_ALL_MANUAL_AP_PROFILES (0x2)
+    const LIST_FLAGS: u32 = 0x3;
     unsafe {
         let mut negotiated: u32 = 0;
         let mut handle = Default::default();
@@ -1997,20 +2082,30 @@ pub fn list_wifi_networks() -> Vec<WifiNetwork> {
             let _ = WlanCloseHandle(client, None);
             return Vec::new();
         }
-        let iface = &(*list).InterfaceInfo[0];
-        let mut avail: *mut WLAN_AVAILABLE_NETWORK_LIST = std::ptr::null_mut();
+        let iface_count = (*list).dwNumberOfItems as usize;
         let mut out = Vec::new();
-        if WlanGetAvailableNetworkList(client, &iface.InterfaceGuid, 0, None, &mut avail) == 0
-            && !avail.is_null()
-        {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for if_idx in 0..iface_count {
+            let iface = &(*list).InterfaceInfo[if_idx];
+            let mut avail: *mut WLAN_AVAILABLE_NETWORK_LIST = std::ptr::null_mut();
+            if WlanGetAvailableNetworkList(client, &iface.InterfaceGuid, LIST_FLAGS, None, &mut avail) != 0
+                || avail.is_null()
+            {
+                continue;
+            }
             let net_list = &*avail;
             // `Network` is a flexible array (declared length 1) — index via raw
             // pointer arithmetic to stay in bounds.
             let first = net_list.Network.as_ptr();
             for i in 0..net_list.dwNumberOfItems as usize {
                 let net = &*first.add(i);
-                let ssid = dot11_ssid_to_string(&net.dot11Ssid);
-                if !ssid.is_empty() {
+                // Prefer the SSID; hidden networks fall back to their profile name.
+                let mut ssid = dot11_ssid_to_string(&net.dot11Ssid);
+                if ssid.is_empty() {
+                    ssid = wide_to_string(&net.strProfileName);
+                }
+                if !ssid.is_empty() && seen.insert(ssid.clone()) {
                     out.push(WifiNetwork { ssid });
                 }
             }
@@ -2022,48 +2117,83 @@ pub fn list_wifi_networks() -> Vec<WifiNetwork> {
     }
 }
 
+/// Turns the Wi-Fi radio on/off using the modern Windows.Devices.Radios API.
 #[cfg(target_os = "windows")]
 pub fn set_wifi_radio(on: bool) -> bool {
-    use windows::Win32::NetworkManagement::WiFi::{
-        WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanSetInterface,
-        WLAN_INTERFACE_INFO_LIST, wlan_intf_opcode_radio_state,
-    };
-    const WLAN_CLIENT_VERSION: u32 = 2;
-    unsafe {
-        let mut negotiated: u32 = 0;
-        let mut handle = Default::default();
-        if WlanOpenHandle(WLAN_CLIENT_VERSION, None, &mut negotiated, &mut handle) != 0 {
-            return false;
+    use windows::Devices::Radios::RadioKind;
+    set_radio_kind(RadioKind::WiFi, on)
+}
+
+/// Turns the Bluetooth radio on/off.
+#[cfg(target_os = "windows")]
+pub fn set_bluetooth_radio(on: bool) -> bool {
+    use windows::Devices::Radios::RadioKind;
+    set_radio_kind(RadioKind::Bluetooth, on)
+}
+
+/// Returns whether the given radio is on (Wi-Fi / Bluetooth).
+#[cfg(target_os = "windows")]
+pub fn radio_is_on(kind: windows::Devices::Radios::RadioKind) -> bool {
+    use windows::Devices::Radios::{Radio, RadioState};
+    let Ok(op) = Radio::GetRadiosAsync() else { return false };
+    let Ok(radios) = op.get() else { return false };
+    for i in 0..radios.Size().unwrap_or(0) {
+        let Ok(radio) = radios.GetAt(i) else { continue };
+        if radio.Kind().ok() == Some(kind) {
+            return radio.State().ok() == Some(RadioState::On);
         }
-        let client: windows::Win32::Foundation::HANDLE = handle;
-        let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
-        if WlanEnumInterfaces(client, None, &mut list) != 0 || list.is_null() {
-            let _ = WlanCloseHandle(client, None);
-            return false;
-        }
-        let iface = &(*list).InterfaceInfo[0];
-        // WLAN_RADIO_STATE: one-byte uSoftApHardwareState/uSoftwareRadioState.
-        // We only toggle the software state (byte 2 of the 3-byte struct padded to 4).
-        let mut radio_state = [0u8; 8];
-        // dot11SoftwareRadioState param: set 0/1 (1 = on).
-        radio_state[1] = if on { 1 } else { 0 };
-        let rc = WlanSetInterface(
-            client,
-            &iface.InterfaceGuid,
-            wlan_intf_opcode_radio_state,
-            std::mem::size_of_val(&radio_state) as u32,
-            radio_state.as_ptr().cast(),
-            None,
-        );
-        WlanFreeMemory(list.cast());
-        let _ = WlanCloseHandle(client, None);
-        rc == 0
     }
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub fn wifi_radio_is_on() -> bool {
+    use windows::Devices::Radios::RadioKind;
+    radio_is_on(RadioKind::WiFi)
+}
+
+#[cfg(target_os = "windows")]
+pub fn bluetooth_radio_is_on() -> bool {
+    use windows::Devices::Radios::RadioKind;
+    radio_is_on(RadioKind::Bluetooth)
+}
+
+#[cfg(target_os = "windows")]
+fn set_radio_kind(kind: windows::Devices::Radios::RadioKind, on: bool) -> bool {
+    use windows::Devices::Radios::{Radio, RadioState};
+    let Ok(op) = Radio::GetRadiosAsync() else { return false };
+    let Ok(radios) = op.get() else { return false };
+    let count = radios.Size().unwrap_or(0);
+    let mut changed = false;
+    for i in 0..count {
+        let Ok(radio) = radios.GetAt(i) else { continue };
+        if radio.Kind().ok() != Some(kind) {
+            continue;
+        }
+        let target = if on { RadioState::On } else { RadioState::Off };
+        // Already in the requested state — nothing to do (still counts as success).
+        if radio.State().ok() == Some(target) {
+            changed = true;
+            continue;
+        }
+        if let Ok(state_op) = radio.SetStateAsync(target) {
+            match state_op.get() {
+                Ok(status) => {
+                    // RadioAccessStatus: 0 allowed, 1 deniedByUser, 2 deniedBySystem,
+                    // 3 unspecified. Only "allowed" means it actually applied.
+                    debug_log(&format!("[radio] SetState({:?}) -> {:?}", kind, status.0));
+                    changed |= status.0 == 0;
+                }
+                Err(e) => debug_log(&format!("[radio] SetState failed: {e:?}")),
+            }
+        }
+    }
+    changed
 }
 
 // --- Bluetooth ---
 
-/// Enumerates remembered / currently-connected Bluetooth devices (name + state).
+/// Enumerates paired / remembered / currently-connected Bluetooth devices.
 #[cfg(target_os = "windows")]
 pub fn list_bluetooth_devices() -> Vec<(String, bool)> {
     use windows::Win32::Devices::Bluetooth::{
@@ -2073,6 +2203,9 @@ pub fn list_bluetooth_devices() -> Vec<(String, bool)> {
     unsafe {
         let params = BLUETOOTH_DEVICE_SEARCH_PARAMS {
             dwSize: std::mem::size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32,
+            // Paired devices are "authenticated" — without this flag most real
+            // devices are skipped.
+            fReturnAuthenticated: windows::Win32::Foundation::BOOL(1),
             fReturnRemembered: windows::Win32::Foundation::BOOL(1),
             fReturnUnknown: windows::Win32::Foundation::BOOL(1),
             fReturnConnected: windows::Win32::Foundation::BOOL(1),
@@ -2081,15 +2214,15 @@ pub fn list_bluetooth_devices() -> Vec<(String, bool)> {
         let mut info = BLUETOOTH_DEVICE_INFO::default();
         info.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
         let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let Ok(find) = BluetoothFindFirstDevice(&params, &mut info) else {
             return out;
         };
         loop {
             let name = wide_to_string(&info.szName);
-            if !name.is_empty() {
+            if !name.is_empty() && seen.insert(name.clone()) {
                 out.push((name, info.fConnected.as_bool()));
             }
-            // Find next.
             let mut next = BLUETOOTH_DEVICE_INFO::default();
             next.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
             if BluetoothFindNextDevice(find, &mut next).is_err() {
@@ -2100,15 +2233,6 @@ pub fn list_bluetooth_devices() -> Vec<(String, bool)> {
         let _ = BluetoothFindDeviceClose(find);
         out
     }
-}
-
-/// Disables/re-enables the Bluetooth radio (best effort; bthprops may be absent).
-#[allow(dead_code)]
-#[cfg(target_os = "windows")]
-pub fn set_bluetooth_radio(on: bool) -> bool {
-    let _ = on;
-    // BluetoothEnableRadio isn't exposed in this crate; return unchanged state.
-    false
 }
 
 // --- Do Not Disturb (Peace) ---
@@ -2156,6 +2280,81 @@ fn dot11_ssid_to_string(ssid: &windows::Win32::NetworkManagement::WiFi::DOT11_SS
         let bytes = std::slice::from_raw_parts(p.add(4), len.min(32));
         String::from_utf8_lossy(bytes).into_owned()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wallpapers - list/select files in %USERPROFILE%\.strland\strpaper\
+// ---------------------------------------------------------------------------
+
+/// The wallpaper directory (created if missing).
+#[cfg(target_os = "windows")]
+pub fn wallpaper_dir() -> std::path::PathBuf {
+    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
+    let dir = std::path::PathBuf::from(home).join(".strland").join("strpaper");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+const WALLPAPER_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "gif", "webp", "mp4", "webm", "mov", "avi", "mkv"];
+
+/// Lists wallpaper files (any name with a supported extension) in the
+/// wallpaper directory, sorted by name.
+#[cfg(target_os = "windows")]
+pub fn list_wallpapers() -> Vec<String> {
+    let dir = wallpaper_dir();
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if !ft.is_file() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            let ext = e
+                .path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.to_ascii_lowercase())
+                .unwrap_or_default();
+            if WALLPAPER_EXTS.contains(&ext.as_str()) {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Returns the currently selected wallpaper name from the folder's
+/// `config.toml` (`wallpaper = "<name>"`), if any.
+#[cfg(target_os = "windows")]
+pub fn current_wallpaper() -> Option<String> {
+    let text = std::fs::read_to_string(wallpaper_dir().join("config.toml")).ok()?;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        if !key.trim().eq_ignore_ascii_case("wallpaper") {
+            continue;
+        }
+        let v = value.trim().trim_matches('"').trim();
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Writes the selected wallpaper name into the folder's `config.toml`
+/// (`wallpaper = "<name>"`), which strpaper reads.
+#[cfg(target_os = "windows")]
+pub fn set_wallpaper(name: &str) -> bool {
+    let dir = wallpaper_dir();
+    let path = dir.join("config.toml");
+    let content = format!("wallpaper = \"{name}\"\n");
+    std::fs::write(&path, content).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2332,9 +2531,21 @@ pub fn tick_ms() -> u64 { 0 }
 #[cfg(not(target_os = "windows"))]
 pub fn take_media_key_event(_max_age_ms: u64) -> Option<u32> { None }
 #[cfg(not(target_os = "windows"))]
+pub fn shell_is_running() -> bool { true }
+#[cfg(not(target_os = "windows"))]
+pub fn apply_media_key(_kind: u32) -> bool { false }
+#[cfg(not(target_os = "windows"))]
 pub fn take_super_key(_max_age_ms: u64) -> bool { false }
 #[cfg(not(target_os = "windows"))]
 pub fn take_control_open(_max_age_ms: u64) -> bool { false }
+#[cfg(not(target_os = "windows"))]
+pub fn take_wallpaper_open(_max_age_ms: u64) -> bool { false }
+#[cfg(not(target_os = "windows"))]
+pub fn list_wallpapers() -> Vec<String> { Vec::new() }
+#[cfg(not(target_os = "windows"))]
+pub fn current_wallpaper() -> Option<String> { None }
+#[cfg(not(target_os = "windows"))]
+pub fn set_wallpaper(_name: &str) -> bool { false }
 #[cfg(not(target_os = "windows"))]
 pub fn switcher_alt_down() -> bool { false }
 #[cfg(not(target_os = "windows"))]
@@ -2386,8 +2597,12 @@ pub fn list_wifi_networks() -> Vec<WifiNetwork> { Vec::new() }
 #[cfg(not(target_os = "windows"))]
 pub fn set_wifi_radio(_on: bool) -> bool { false }
 #[cfg(not(target_os = "windows"))]
-pub fn list_bluetooth_devices() -> Vec<(String, bool)> { Vec::new() }
+pub fn set_wifi_radio(_on: bool) -> bool { false }
 #[cfg(not(target_os = "windows"))]
 pub fn set_bluetooth_radio(_on: bool) -> bool { false }
+#[cfg(not(target_os = "windows"))]
+pub fn wifi_radio_is_on() -> bool { false }
+#[cfg(not(target_os = "windows"))]
+pub fn bluetooth_radio_is_on() -> bool { false }
 #[cfg(not(target_os = "windows"))]
 pub fn set_quiet_hours(_on: bool) {}

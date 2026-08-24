@@ -8,17 +8,26 @@
 //! %USERPROFILE%\.strland\strpaper.log
 //! ```
 
-use std::io::Write;
-
 /// Append a line to the strpaper log.
+///
+/// Diagnostics are a development aid only: release builds compile this to
+/// nothing, so no log file is ever written.
 pub fn log(msg: &str) {
-    let dir = crate::storage::wallpaper_dir();
-    let path = dir.parent().map(|p| p.join("strpaper.log")).unwrap_or(dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    #[cfg(debug_assertions)]
     {
-        let _ = writeln!(f, "strpaper: {msg}");
+        use std::io::Write;
+        let dir = crate::storage::wallpaper_dir();
+        let path = dir.parent().map(|p| p.join("strpaper.log")).unwrap_or(dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "strpaper: {msg}");
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = msg;
     }
 }

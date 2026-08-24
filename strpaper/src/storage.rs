@@ -20,6 +20,17 @@ use std::path::{Path, PathBuf};
 /// The fixed filename prefix used for every supported wallpaper.
 pub const WALLPAPER_BASENAME: &str = "wallpaper";
 
+/// Optional configuration file inside the wallpaper directory.
+///
+/// ```toml
+/// # Which file in this directory to show, e.g.:
+/// wallpaper = "sunset.mp4"
+/// ```
+///
+/// Omitting it keeps the default behaviour: the most recently modified
+/// `wallpaper.<ext>` file is shown.
+pub const CONFIG_FILE_NAME: &str = "config.toml";
+
 /// The recognised wallpaper file extensions, in canonical order.
 ///
 /// Any `wallpaper.<ext>` file inside the wallpaper directory is a candidate.
@@ -128,6 +139,104 @@ pub fn choose_primary(candidates: &mut Vec<Candidate>) -> Option<Candidate> {
             .then_with(|| a.path.cmp(&b.path))
     });
     Some(candidates.remove(0))
+}
+
+/// Path of the optional config file inside the wallpaper directory.
+pub fn config_path(dir: &Path) -> PathBuf {
+    dir.join(CONFIG_FILE_NAME)
+}
+
+/// Read the configured wallpaper file name (the `wallpaper` key), if any.
+///
+/// Deliberately dependency-free: one `key = "value"` line, `#` comments.
+pub fn read_configured_name(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(config_path(dir)).ok()?;
+    parse_wallpaper_name(&text)
+}
+
+/// Read the optional `quality` key — the height videos are pre-scaled to
+/// before playback (e.g. `"1080p"`, `"720p"`, `1080`). `None` keeps the
+/// source resolution.
+pub fn read_configured_quality(dir: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(config_path(dir)).ok()?;
+    parse_quality(&text)
+}
+
+fn parse_quality(text: &str) -> Option<u32> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("quality") {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim().to_ascii_lowercase();
+        if value.is_empty() || value == "source" || value == "original" {
+            return None;
+        }
+        let digits = value.trim_end_matches('p');
+        if let Ok(h) = digits.parse::<u32>() {
+            return Some(h);
+        }
+    }
+    None
+}
+
+fn parse_wallpaper_name(text: &str) -> Option<String> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("wallpaper") {
+            continue;
+        }
+        let value = value.trim();
+        // Strip one layer of quotes if present.
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .map(str::trim)
+            .unwrap_or(value);
+        return if value.is_empty() { None } else { Some(value.to_string()) };
+    }
+    None
+}
+
+/// Resolve the wallpaper file to display.
+///
+/// With a valid configured name that exists in the directory, that file is
+/// used. Otherwise the default priority rules apply (see [`choose_primary`]).
+pub fn resolve_wallpaper_file(dir: &Path, name: Option<&str>) -> Option<PathBuf> {
+    if let Some(name) = name {
+        let rel = Path::new(name);
+        // Only bare file names inside the wallpaper dir are allowed.
+        if rel.components().count() == 1 {
+            let supported = rel
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    SUPPORTED_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str())
+                })
+                .unwrap_or(false);
+            if supported {
+                let path = dir.join(rel);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+        // Fall through: invalid/missing configuration falls back to defaults.
+    }
+    let mut candidates = list_candidates(dir);
+    choose_primary(&mut candidates).map(|c| c.path)
 }
 
 fn ext_rank(path: &Path) -> usize {

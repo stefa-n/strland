@@ -277,14 +277,17 @@ pub fn draw_control_center(
     ];
 
     let status = win::system_status();
+    let wifi_on = win::wifi_radio_is_on();
     let wifi_name = win::current_wifi_ssid();
     let wifi_sub = if status.wifi_connected {
         if wifi_name.is_empty() { "Connected".to_string() } else { wifi_name }
+    } else if wifi_on {
+        "Not connected".to_string()
     } else {
         "Off".to_string()
     };
 
-    let zone = tile(ui, row1[0], "Wi-Fi", &wifi_sub, Some(&icons.wifi), accent, 1.0, status.wifi_connected);
+    let zone = tile(ui, row1[0], "Wi-Fi", &wifi_sub, Some(&icons.wifi), accent, 1.0, wifi_on);
     match zone {
         TileZone::Icon => actions.push(ControlAction::ToggleWifi),
         TileZone::Text => actions.push(ControlAction::OpenSubmenu(ControlSubmenu::Wifi)),
@@ -302,13 +305,16 @@ pub fn draw_control_center(
         TileZone::None => {}
     }
 
+    let bt_on = win::bluetooth_radio_is_on();
     let bt_name = win::current_bluetooth_name();
     let bt_sub = if status.bluetooth_connected {
         if bt_name.is_empty() { "On".to_string() } else { bt_name }
+    } else if bt_on {
+        "Not connected".to_string()
     } else {
         "Off".to_string()
     };
-    let zone = tile(ui, row2[0], "Bluetooth", &bt_sub, Some(&icons.bt), accent, 1.0, status.bluetooth_connected);
+    let zone = tile(ui, row2[0], "Bluetooth", &bt_sub, Some(&icons.bt), accent, 1.0, bt_on);
     match zone {
         TileZone::Icon => actions.push(ControlAction::ToggleBluetooth),
         TileZone::Text => actions.push(ControlAction::OpenSubmenu(ControlSubmenu::Bluetooth)),

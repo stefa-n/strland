@@ -1,8 +1,12 @@
+// No console window in release builds (debug keeps one for the [notify] logs).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod config;
 mod launcher;
 mod modes;
 mod power;
 mod switcher;
+mod wallpaper;
 mod win;
 
 use chrono::Local;
@@ -58,9 +62,11 @@ fn island_viewport_size(
     hover_anim: f32,
     power_open: bool,
     control_open: bool,
+    wallpaper_open: bool,
     switcher_active: bool,
     power_anim: f32,
     control_anim: f32,
+    wallpaper_anim: f32,
 ) -> egui::Vec2 {
     if switcher_active {
         return egui::vec2(760.0, 520.0);
@@ -80,18 +86,24 @@ fn island_viewport_size(
     // Control-center growth below the pill.
     let control_width = closed_width.max(560.0 + 40.0);
     let control_height = cfg.border_radius + 8.0 + 500.0 + 24.0;
+    // Wallpaper panel growth below the pill.
+    let wallpaper_width = closed_width.max(560.0 + 40.0);
+    let wallpaper_height = cfg.border_radius + 8.0 + 420.0 + 24.0;
     let tl = ease_out_cubic(launcher_anim);
     let th = ease_out_cubic(hover_anim);
     // Snap the window to full size immediately so the native window can't lag
     // behind the drawn panel (prevents clipping); only the content eases in.
     let tp = if power_open { 1.0 } else { ease_out_cubic(power_anim) };
     let tc = if control_open { 1.0 } else { ease_out_cubic(control_anim) };
+    let tw = if wallpaper_open { 1.0 } else { ease_out_cubic(wallpaper_anim) };
     let w = lerp(lerp(closed_width, open_width, tl), hover_width, th);
     let h = lerp(lerp(closed_height, open_height, tl), hover_height, th);
     let w = lerp(w, power_width, tp);
     let h = lerp(h, power_height, tp);
     let w = lerp(w, control_width, tc);
     let h = lerp(h, control_height, tc);
+    let w = lerp(w, wallpaper_width, tw);
+    let h = lerp(h, wallpaper_height, tw);
     egui::vec2(w, h)
 }
 
@@ -193,6 +205,8 @@ struct DynamicIslandApp {
     switcher: switcher::SwitcherState,
     last_switcher_tab: u64,
 
+    wallpaper: wallpaper::WallpaperState,
+
     control_open: bool,
     control_state: modes::ControlCenterState,
     control_icons: Option<modes::ControlCenterIcons>,
@@ -227,7 +241,7 @@ impl DynamicIslandApp {
         let hwnd = None;
 
         let now = Instant::now();
-        let viewport_size = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, 0.0, 0.0);
+        let viewport_size = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, false, 0.0, 0.0, 0.0);
         let start_y = -(viewport_size.y + cfg.y_padding);
         let clock = formatted_clock(&cfg);
         let day = formatted_day();
@@ -278,6 +292,7 @@ impl DynamicIslandApp {
             power_icons: None,
             switcher: switcher::SwitcherState::new(),
             last_switcher_tab: 0,
+            wallpaper: wallpaper::WallpaperState::new(),
             control_open: false,
             control_state: modes::ControlCenterState::default(),
             control_icons: None,
@@ -291,7 +306,7 @@ impl DynamicIslandApp {
     }
 
     fn sync_viewport_size(&mut self, ctx: &egui::Context) {
-        let desired = island_viewport_size(&self.cfg, self.launcher.anim, self.hover_anim, self.power.open, self.control_open, self.switcher.active || self.switcher.anim > 0.001, self.power.anim, self.control_anim);
+        let desired = island_viewport_size(&self.cfg, self.launcher.anim, self.hover_anim, self.power.open, self.control_open, self.wallpaper.open, self.switcher.active || self.switcher.anim > 0.001, self.power.anim, self.control_anim, self.wallpaper.anim);
         if desired == self.viewport_size {
             return;
         }
@@ -408,8 +423,12 @@ impl DynamicIslandApp {
 
     fn poll_volume(&mut self, now: Instant) {
         // Media keys (volume up/down/mute) trigger the UI even without a shell —
-        // the hook applies the change itself in that case.
-        if win::take_media_key_event(500).is_some() {
+        // when there's no shell we apply the change ourselves (on this thread,
+        // never inside the keyboard hook).
+        if let Some(kind) = win::take_media_key_event(500) {
+            if !win::shell_is_running() {
+                win::apply_media_key(kind);
+            }
             self.mode = IslandMode::Volume;
             self.volume_mode_deadline =
                 Some(now + Duration::from_millis(self.cfg.volume_timeout_ms));
@@ -507,9 +526,10 @@ impl DynamicIslandApp {
         }
     }
 
-    /// Slides the island back down (un-hides) if it's currently hidden.
+    /// Slides the island back down (un-hides) if it's currently hidden. Skipped
+    /// when the cursor is hidden (games) so we don't pop over gameplay.
     fn bring_down_if_hidden(&mut self) {
-        if self.hidden {
+        if self.hidden && win::cursor_visible() {
             self.hidden = false;
             self.target_y = self.cfg.y_padding;
             self.y_animating = true;
@@ -606,12 +626,17 @@ impl eframe::App for DynamicIslandApp {
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
 
+        // While hidden the pill isn't rendered — poll slowly and skip cosmetic
+        // work (clock text) so idle redraws are rare. Volume keys / notifications
+        // still wake it because those polls keep running.
+        let hidden_idle = self.hidden && !self.switcher.active;
+
         // --- Polls (only when due) ---
         if now >= self.polls.next_config {
             self.apply_config_reload(ctx);
             self.polls.next_config = now + Duration::from_millis(self.cfg.config_poll_ms);
         }
-        if now >= self.polls.next_clock {
+        if !hidden_idle && now >= self.polls.next_clock {
             self.update_clock();
             self.polls.next_clock = now + Duration::from_millis(self.cfg.clock_poll_ms);
         }
@@ -627,11 +652,14 @@ impl eframe::App for DynamicIslandApp {
             if self.notif.is_none() && !holding {
                 self.poll_window_state(&cursor);
             }
-            self.polls.next_window = now + Duration::from_millis(self.cfg.window_poll_ms);
+            // When hidden there's nothing to watch on screen — poll slowly.
+            let window_poll = if hidden_idle { 150 } else { self.cfg.window_poll_ms };
+            self.polls.next_window = now + Duration::from_millis(window_poll);
         }
         if now >= self.polls.next_volume {
             self.poll_volume(now);
-            self.polls.next_volume = now + Duration::from_millis(self.cfg.volume_poll_ms);
+            let volume_poll = if hidden_idle { 150 } else { self.cfg.volume_poll_ms };
+            self.polls.next_volume = now + Duration::from_millis(volume_poll);
         }
 
         // Media playing is polled on a background thread — just read the atomic
@@ -720,10 +748,17 @@ impl eframe::App for DynamicIslandApp {
             }
         }
 
-        // Super/Windows key → open the app launcher.
+        // Super/Windows key → open the app launcher (closing any other overlay).
         if win::take_super_key(300) {
             if self.power.open {
                 self.power.close();
+            }
+            if self.control_open {
+                self.control_open = false;
+                self.control_state.submenu = modes::ControlSubmenu::None;
+            }
+            if self.wallpaper.open {
+                self.wallpaper.close();
             }
             self.set_launcher_open(ctx, true);
         }
@@ -738,7 +773,30 @@ impl eframe::App for DynamicIslandApp {
                 if self.launcher.open {
                     self.set_launcher_open(ctx, false);
                 }
+                if self.wallpaper.open {
+                    self.wallpaper.close();
+                }
                 // Freeze hover so the panel doesn't ride the expanding pill.
+                self.hover_anim = 0.0;
+                self.focus_window();
+            }
+        }
+
+        // Win+W → toggle the wallpaper panel (closing any other overlay).
+        if win::take_wallpaper_open(300) {
+            win::debug_log("[wallpaper] Win+W trigger fired — opening panel");
+            self.wallpaper.open = !self.wallpaper.open;
+            if self.wallpaper.open {
+                if self.power.open {
+                    self.power.close();
+                }
+                if self.launcher.open {
+                    self.set_launcher_open(ctx, false);
+                }
+                if self.control_open {
+                    self.control_open = false;
+                    self.control_state.submenu = modes::ControlSubmenu::None;
+                }
                 self.hover_anim = 0.0;
                 self.focus_window();
             }
@@ -749,6 +807,9 @@ impl eframe::App for DynamicIslandApp {
             } else {
                 self.control_open = false;
             }
+        }
+        if self.wallpaper.open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.wallpaper.close();
         }
         // Animate the menu's list of open/close and refresh the geometry.
         let power_target = if self.power.open { 1.0 } else { 0.0 };
@@ -766,6 +827,13 @@ impl eframe::App for DynamicIslandApp {
         self.control_anim = ca;
         if !self.control_open && self.control_anim <= 0.001 {
             self.control_anim = 0.0;
+        }
+        // Animate the wallpaper panel open/close.
+        let wp_target = if self.wallpaper.open { 1.0 } else { 0.0 };
+        let (wa, _) = smooth_step(self.wallpaper.anim, wp_target, dt, 9.0);
+        self.wallpaper.anim = wa;
+        if !self.wallpaper.open && self.wallpaper.anim <= 0.001 {
+            self.wallpaper.anim = 0.0;
         }
 
         // Clicking outside the app (window loses focus entirely) closes any
@@ -959,7 +1027,7 @@ impl eframe::App for DynamicIslandApp {
         }
 
         // Clickthrough logic — reuse the local cursor computed earlier
-        let overlay_open = self.launcher.open || self.power.open || self.control_open;
+        let overlay_open = self.launcher.open || self.power.open || self.control_open || self.wallpaper.open;
         let interactive = overlay_open
             || point_in_round_rect(local_cursor, pill_rect, self.cfg.border_radius)
             || (morphing
@@ -1279,12 +1347,13 @@ impl eframe::App for DynamicIslandApp {
                                     win::toggle_mute();
                                 }
                                 modes::ControlAction::ToggleWifi => {
-                                    // Toggle the radio; refresh on next poll.
-                                    let on = !win::system_status().wifi_connected;
+                                    // Toggle the actual radio state.
+                                    let on = !win::wifi_radio_is_on();
                                     win::set_wifi_radio(on);
                                 }
                                 modes::ControlAction::ToggleBluetooth => {
-                                    // Radio toggle not exposed; reflect state.
+                                    let on = !win::bluetooth_radio_is_on();
+                                    win::set_bluetooth_radio(on);
                                 }
                                 modes::ControlAction::ToggleDnd => {
                                     self.control_state.dnd = !self.control_state.dnd;
@@ -1320,6 +1389,43 @@ impl eframe::App for DynamicIslandApp {
                     self.power.open_menu();
                     self.focus_window();
                 }
+            }
+        }
+
+        // --- Wallpaper panel ---
+        if self.wallpaper.anim > 0.001 {
+            let we = ease_out_cubic(self.wallpaper.anim);
+            let wp_width = 560.0f32.min(viewport_rect.width() - 40.0);
+            let wp_height = 420.0f32;
+            let target = egui::Rect::from_min_size(
+                egui::pos2(viewport_rect.center().x - wp_width / 2.0, pill_rect.top()),
+                egui::vec2(wp_width, wp_height),
+            );
+            // Grow out of the clock pill for a smooth transition.
+            let panel = lerp_rect(pill_rect, target, we);
+            let accent = Config::parse_color(&self.cfg.accent_color);
+            let mut picked: Option<String> = None;
+            egui::Area::new(egui::Id::new("wallpaper_panel"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(panel.min)
+                .movable(false)
+                .show(ctx, |ui| {
+                    if let Some(name) =
+                        self.wallpaper.draw(ui, panel, &self.cfg, accent, we)
+                    {
+                        picked = Some(name);
+                    }
+                });
+            // Click outside → close.
+            let click_outside = ctx.input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer.interact_pos().map(|p| !target.contains(p)).unwrap_or(false)
+            });
+            if click_outside {
+                self.wallpaper.close();
+            } else if let Some(name) = picked {
+                win::set_wallpaper(&name);
+                self.wallpaper.refresh_after_selection(&name);
             }
         }
 
@@ -1359,8 +1465,9 @@ impl eframe::App for DynamicIslandApp {
         let hover_animating = self.hover_anim > 0.001 && self.hover_anim < 0.999;
         let power_animating = self.power.anim > 0.001 && self.power.anim < 0.999;
         let control_animating = self.control_anim > 0.001 && self.control_anim < 0.999;
+        let wallpaper_animating = self.wallpaper.anim > 0.001 && self.wallpaper.anim < 0.999;
         let switcher_animating = self.switcher.active || (self.switcher.anim > 0.001 && self.switcher.anim < 0.999);
-        let animating = self.y_animating || self.width_animating || launcher_animating || hover_animating || power_animating || control_animating || switcher_animating;
+        let animating = self.y_animating || self.width_animating || launcher_animating || hover_animating || power_animating || control_animating || switcher_animating || wallpaper_animating;
         let viz_active = self.visualizer_visibility > 0.01;
         let notification_active = self.mode == IslandMode::Notification;
         // A marquee-scrolling media title needs continuous repaints even after
@@ -1390,6 +1497,12 @@ impl eframe::App for DynamicIslandApp {
             ctx.request_repaint_after(Duration::from_millis(50));
         } else if self.control_open {
             ctx.request_repaint_after(Duration::from_millis(50));
+        } else if self.wallpaper.open {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else if self.hidden {
+            // Hidden: nothing is rendered, so idle at a low cadence. Volume
+            // keys / notifications are still picked up by the (slowed) polls.
+            ctx.request_repaint_after(Duration::from_millis(150));
         } else {
             // Idle: sleep until next poll
             let next_due = self.polls.earliest();
@@ -1510,7 +1623,7 @@ fn main() -> eframe::Result {
     // Start notification listener (reads Windows toast notifications)
     win::start_notification_listener();
 
-    let viewport = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, 0.0, 0.0);
+    let viewport = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, false, 0.0, 0.0, 0.0);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([viewport.x, viewport.y])

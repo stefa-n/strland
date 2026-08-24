@@ -10,12 +10,16 @@
 //! window itself.
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM, BOOL};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MonitorFromWindow,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, FindWindowW, GetDesktopWindow, GetSystemMetrics, SendMessageW,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    EnumWindows, FindWindowExW, FindWindowW, GetClassNameW, GetDesktopWindow,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE,
+    IsIconic, IsWindowVisible, SendMessageW, GetWindowPlacement, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SW_SHOWMAXIMIZED, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 /// The magic message that makes Explorer create/refresh the desktop WorkerW.
@@ -58,6 +62,90 @@ pub fn find_host() -> Option<HWND> {
         None
     }
 }
+
+/// True when **any** visible application window is maximized or fullscreen —
+/// in which case the desktop is covered and there is nothing to render.
+pub fn any_window_covers_desktop() -> bool {
+    let mut found = false;
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_maximized_proc),
+            LPARAM(&mut found as *mut bool as isize),
+        );
+    }
+    found
+}
+
+/// Windows that belong to the shell/desktop itself and never count as "an app
+/// covering the screen".
+const SHELL_WINDOW_CLASSES: [&str; 4] =
+    ["Progman", "WorkerW", "Shell_TrayWnd", "strpaper.WallpaperWindow"];
+
+unsafe extern "system" fn enum_maximized_proc(hwnd: HWND, lparam: LPARAM) -> BOOL { unsafe {
+    let found = lparam.0 as *mut bool;
+
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        return true.into();
+    }
+
+    // Skip cloaked windows: suspended UWP apps and similar ghosts stay alive
+    // with stale sizes and report themselves as visible, but are not rendered.
+    let mut cloaked = 0u32;
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED,
+        &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+        std::mem::size_of::<u32>() as u32,
+    )
+    .is_ok()
+        && cloaked != 0
+    {
+        return true.into();
+    }
+
+    // Skip tool windows / screen overlays (widgets, launchers, helpers) —
+    // genuine maximized apps are never tool windows.
+    let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if exstyle & WS_EX_TOOLWINDOW.0 as isize != 0 {
+        return true.into();
+    }
+
+    // Skip shell / our own windows.
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(hwnd, &mut cls);
+    let name = String::from_utf16_lossy(&cls[..(n.max(0) as usize).min(cls.len())]);
+    if SHELL_WINDOW_CLASSES.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+        return true.into();
+    }
+
+    // Maximized?
+    let mut placement = WINDOWPLACEMENT::default();
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    if GetWindowPlacement(hwnd, &mut placement).is_ok()
+        && placement.showCmd == SW_SHOWMAXIMIZED.0 as u32
+    {
+        *found = true;
+        return false.into();
+    }
+
+    // Fullscreen: window rect covers its entire monitor.
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_ok() {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO::default();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info).as_bool()
+            && rect.left <= info.rcMonitor.left
+            && rect.top <= info.rcMonitor.top
+            && rect.right >= info.rcMonitor.right
+            && rect.bottom >= info.rcMonitor.bottom
+        {
+            *found = true;
+            return false.into();
+        }
+    }
+    true.into()
+}}
 
 /// Enumerate the monitors of the virtual desktop.
 pub fn monitors() -> Vec<Monitor> {
