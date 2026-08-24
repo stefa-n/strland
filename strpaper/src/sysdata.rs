@@ -501,3 +501,127 @@ fn parse_battery_from_name(name: &str) -> i64 {
     }
     -1
 }
+
+// ---------------------------------------------------------------------------
+// GPU utilization (PDH "GPU Engine" performance counters)
+// ---------------------------------------------------------------------------
+
+/// Latest total 3D-engine GPU utilisation in percent (0-100).
+static GPU_PERCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static GPU_POLL_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Start the background poller that samples GPU utilisation once per second.
+pub fn start_gpu_poller() {
+    if GPU_POLL_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("strpaper-gpu".into())
+        .spawn(|| unsafe { gpu_poll_loop() })
+        .ok();
+}
+
+/// Current GPU utilisation percentage (0-100), sampled by the background
+/// poller. Returns 0 before the first sample is available.
+pub fn gpu_usage() -> i64 {
+    GPU_PERCENT.load(Ordering::Relaxed).min(100) as i64
+}
+
+unsafe fn gpu_poll_loop() { unsafe {
+    use windows::core::w;
+    use windows::Win32::System::Performance::{
+        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+        PdhGetFormattedCounterArrayW, PdhOpenQueryW, PDH_FMT,
+        PDH_FMT_COUNTERVALUE_ITEM_W,
+    };
+
+    // \GPU Engine(*)\Utilization Percentage formatted as double.
+    const PDH_FMT_DOUBLE_FLAG: PDH_FMT = PDH_FMT(0x0000_0200);
+
+    let mut query = 0isize;
+    // PDH functions return WIN32_ERROR; 0 == ERROR_SUCCESS.
+    if PdhOpenQueryW(None, 0, &mut query) != 0 {
+        return;
+    }
+
+    // Wildcard counter: one instance per process/engine. We filter to the 3D
+    // engine type and sum across all processes for a total-utilisation figure.
+    let mut counter = 0isize;
+    if PdhAddEnglishCounterW(
+        query,
+        w!(r"\GPU Engine(*)\Utilization Percentage"),
+        0,
+        &mut counter,
+    ) != 0
+    {
+        let _ = PdhCloseQuery(query);
+        return;
+    }
+
+    loop {
+        // Rate counters need two samples; with a persistent query every
+        // collection after the first yields valid deltas.
+        if PdhCollectQueryData(query) != 0 {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
+        // Query required buffer size.
+        let mut size = 0u32;
+        let mut item_count = 0u32;
+        let _ = PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE_FLAG,
+            &mut size,
+            &mut item_count,
+            None,
+        );
+        if size == 0 {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        let mut buf = vec![0u8; size as usize];
+
+        item_count = 0;
+        if PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE_FLAG,
+            &mut size,
+            &mut item_count,
+            Some(buf.as_mut_ptr().cast()),
+        ) != 0
+        {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
+        // Walk the item array: each entry is { szName: PWSTR, value }.
+        let item_size = std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+        if item_size == 0 {
+            break;
+        }
+        let mut total = 0f64;
+        for i in 0..item_count as usize {
+            let item = buf.as_ptr().add(i * item_size) as *const PDH_FMT_COUNTERVALUE_ITEM_W;
+            let item = &*item;
+            let name = item.szName.to_string().unwrap_or_default();
+            if !name.contains("engtype_3D") {
+                continue;
+            }
+            // PDH_FMT_COUNTERVALUE carries the formatted value in a union;
+            // for PDH_FMT_DOUBLE requests the f64 member is the payload and
+            // sits right after the 4-byte status word (aligned to 8).
+            let val = *(std::ptr::addr_of!(item.FmtValue).cast::<u8>()
+                .add(8)
+                .cast::<f64>());
+            if val.is_finite() && val > 0.0 {
+                total += val;
+            }
+        }
+        GPU_PERCENT.store(total.round().clamp(0.0, 100.0) as u32, Ordering::Relaxed);
+
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let _ = PdhCloseQuery(query);
+}}

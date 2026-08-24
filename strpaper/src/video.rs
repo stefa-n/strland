@@ -204,7 +204,7 @@ impl VideoPlayer {
     }
 
     /// Return the most recently decoded frame (if any).
-    pub fn frame_at(&mut self, _elapsed: Duration) -> Option<Arc<Raster>> {
+    pub fn frame_at(&self, _elapsed: Duration) -> Option<Arc<Raster>> {
         let g = self.shared.lock().ok()?;
         Some(g.current.clone())
     }

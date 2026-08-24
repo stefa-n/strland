@@ -128,6 +128,8 @@ fn main() {
     sysdata::start_audio_spectrum_poller();
     // Start media poller (WinRT SMTC for now-playing info)
     sysdata::start_media_poller();
+    // Start GPU utilisation poller (PDH GPU Engine counters)
+    sysdata::start_gpu_poller();
 
     let mut app = App {
         dir,

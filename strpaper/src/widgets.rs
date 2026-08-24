@@ -11,6 +11,9 @@
 //!     pen.clear();
 //!     pen.text(24, 24, "Hello!", 28, "#FFFFFF");
 //! }
+//!
+//! // Optional: pick the update rate for this widget (1-120, default 30).
+//! fn fps() { 5 }
 //! ```
 //!
 //! Pen API: `clear`, `fill_rect(x,y,w,h,color)`, `line(x1,y1,x2,y2,w,color)`,
@@ -25,7 +28,8 @@ use std::time::{Duration, Instant};
 
 use rhai::{Engine, Scope};
 
-/// Frames per second widgets re-run their scripts at.
+/// Default frames per second a widget re-runs its script at. Scripts can
+/// override this per widget with an optional `fn fps()` (clamped 1-120).
 const WIDGET_FPS: u64 = 30;
 
 pub const WIDGETS_DIR_NAME: &str = "widgets";
@@ -361,30 +365,16 @@ impl Pen {
     fn time(&mut self, fmt: &str) -> String {
         unsafe {
             use windows::Win32::System::SystemInformation::GetLocalTime;
-            let st = GetLocalTime();
-            let mut out = String::new();
-            let chars: Vec<char> = fmt.chars().collect();
-            let mut i = 0;
-            while i < chars.len() {
-                if chars[i] == '%' && i + 1 < chars.len() {
-                    let piece = match chars[i + 1] {
-                        'H' => format!("{:02}", st.wHour),
-                        'M' => format!("{:02}", st.wMinute),
-                        'S' => format!("{:02}", st.wSecond),
-                        'Y' => format!("{}", st.wYear),
-                        'm' => format!("{:02}", st.wMonth),
-                        'd' => format!("{:02}", st.wDay),
-                        'p' => if st.wHour < 12 { "AM".into() } else { "PM".into() },
-                        other => format!("%{other}"),
-                    };
-                    out.push_str(&piece);
-                    i += 2;
-                } else {
-                    out.push(chars[i]);
-                    i += 1;
-                }
-            }
-            out
+            format_datetime(GetLocalTime(), fmt)
+        }
+    }
+
+    /// Formatted local date. Without an argument this yields the short
+    /// weekday/month form, e.g. `Mon, Aug 24`.
+    fn date(&mut self, fmt: &str) -> String {
+        unsafe {
+            use windows::Win32::System::SystemInformation::GetLocalTime;
+            format_datetime(GetLocalTime(), fmt)
         }
     }
 
@@ -422,6 +412,49 @@ impl Pen {
             blend_rgba_at(self, x, y, w as usize, h as usize, &resized);
         }
     }
+
+    /// Render an SVG file scaled to `(w x h)` and alpha-blend it at `(x, y)`.
+    fn draw_svg_impl(&mut self, x: i64, y: i64, w: i64, h: i64, path: &str) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let resolved = resolve_widget_path(path);
+        if let Some(rgba) = render_svg_cached(&resolved, w as u32, h as u32) {
+            blend_rgba_at(self, x, y, w as usize, h as usize, &rgba);
+        }
+    }
+
+    /// Draw the current frame of a video file at `(x, y)` scaled to
+    /// `(w x h)`. The file is decoded continuously on a background thread
+    /// (one player per path), so this always shows live playback.
+    fn draw_video_impl(&mut self, x: i64, y: i64, w: i64, h: i64, path: &str) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let resolved = resolve_widget_path(path);
+        // Decode at (up to) the requested size so no pixels are wasted.
+        let target = Some((w.min(3840).max(2) as u32, h.min(2160).max(2) as u32));
+        let Some(player) = video_player_for(&resolved, target) else {
+            return;
+        };
+        let Some(raster) = player.frame_at(Duration::ZERO) else {
+            return;
+        };
+        if raster.width == 0 || raster.height == 0 || raster.bgra.is_empty() {
+            return;
+        }
+        // BGRA -> RGBA for the shared resize/blend helpers.
+        let mut rgba = Vec::with_capacity(raster.bgra.len());
+        for px in raster.bgra.chunks_exact(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        }
+        let resized = resize_rgba(&rgba, raster.width, raster.height, w as usize, h as usize);
+        blend_rgba_at(self, x, y, w as usize, h as usize, &resized);
+    }
+
+    fn gpu_percent(&mut self) -> i64 {
+        crate::sysdata::gpu_usage()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -432,31 +465,38 @@ struct ScriptItem {
     name: String,
     engine: Engine,
     ast: rhai::AST,
+    /// Throttle interval for this widget (from its optional `fn fps()`).
+    interval: Duration,
+    last_run: Instant,
+    /// This widget's own drawing surface (kept between frames so its last
+    /// output stays visible while the script idles).
+    pen: Pen,
+    /// Hash of this widget's most recent output.
+    hash: u64,
+    /// True right after this widget produced pixels different from before.
+    dirty: bool,
 }
 
-/// Runs widget scripts into a shared desktop-sized canvas and tracks damage.
+/// Runs widget scripts into per-widget canvases and accumulates their output
+/// into one desktop-sized buffer that is composited over the wallpaper.
 pub struct WidgetHost {
-    canvas: Pen,
+    width: usize,
+    height: usize,
+    /// Combined premultiplied-BGRA output of every widget (alpha starts 0).
+    buf: Vec<u8>,
     items: Vec<ScriptItem>,
-    last_run: Instant,
-    /// Damage rectangle accumulated since the last composite.
-    pending: Option<(usize, usize, usize, usize)>,
-    /// Extracted pixel data for the pending region (consumed on composite).
-    frame_data: Option<(usize, usize, usize, usize, Vec<u8>)>,
-    /// Hash of the last composited region content.
-    last_hash: u64,
-    /// Set when visible output differs from what is currently on screen.
+    /// Set when any widget produced pixels that differ from its previous
+    /// output (used to skip redundant repaints).
     changed: bool,
 }
 
 impl WidgetHost {
     /// `Some((w, h))` when the canvas is allocated.
     pub fn canvas_dims(&self) -> Option<(usize, usize)> {
-        let (w, h) = self.canvas.dims();
-        if w == 0 || h == 0 {
+        if self.width == 0 || self.height == 0 {
             None
         } else {
-            Some((w, h))
+            Some((self.width, self.height))
         }
     }
 
@@ -465,72 +505,93 @@ impl WidgetHost {
         self.items.len()
     }
 
-    /// True when there is a pending composite frame.
-    pub fn has_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-
     /// True when visible output differs from what is currently displayed.
     pub fn has_changes(&self) -> bool {
         self.changed
     }
 
-    /// Run every script once (throttled to [`WIDGET_FPS`]). Marks `changed`
-    /// only when the produced pixels differ from the previously shown frame.
+    /// Run each script when its own throttle interval elapses (scripts can
+    /// pick their rate with an optional `fn fps()`; default [`WIDGET_FPS`]).
+    ///
+    /// Every script owns a private surface, so a widget's drawing stays on
+    /// screen unchanged while it idles — only the widgets whose code actually
+    /// re-runs produce new pixels.
     pub fn render_tick(&mut self) {
-        if self.items.is_empty()
-            || self.last_run.elapsed() < Duration::from_millis(1000 / WIDGET_FPS)
-        {
+        if self.items.is_empty() {
             return;
         }
-        self.last_run = Instant::now();
+        let now = Instant::now();
 
-        // Clear the canvas so scripts draw on a fresh surface each frame.
-        self.canvas.clear();
+        let due: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| now.duration_since(it.last_run) >= it.interval)
+            .map(|(i, _)| i)
+            .collect();
+        if due.is_empty() {
+            return;
+        }
 
         let mut scope = Scope::new();
 
-        // Run ALL scripts first — they share one canvas and each contributes
-        // to the combined output.
-        for item in &self.items {
-            let pen = self.canvas.clone();
-            if let Err(e) =
-                item.engine.call_fn::<()>(&mut scope, &item.ast, "draw", (pen,))
-            {
-                crate::logger::log(&format!("widget {}: script error: {e}", item.name));
-            }
-        }
+        for i in due {
+            // Run the script and grab its output while the item borrow is
+            // alive; buffer updates happen after the borrow ends.
+            let frame = {
+                let item = &mut self.items[i];
+                item.last_run = now;
+                item.dirty = false;
 
-        // Now capture the combined damage from all scripts in ONE take_frame
-        // call so no widget's contribution is lost.
-        if let Some((x0, y0, x1, y1, bytes)) = self.canvas.take_frame() {
+                // Fresh surface for this run; the previous frame stays in
+                // the combined buffer until this widget actually redraws.
+                item.pen.clear();
+                let pen = item.pen.clone();
+                if let Err(e) =
+                    item.engine.call_fn::<()>(&mut scope, &item.ast, "draw", (pen,))
+                {
+                    crate::logger::log(&format!("widget {}: script error: {e}", item.name));
+                }
+                item.pen.take_frame()
+            };
+            let Some((x0, y0, x1, y1, bytes)) = frame else {
+                continue;
+            };
             let hash = fnv_hash(&bytes);
-            if self.last_hash != hash || self.pending.is_none() {
-                self.changed = true;
-                self.last_hash = hash;
-                self.frame_data =
-                    Some((x0, y0, x1, y1, bytes));
-                self.pending = Some((x0, y0, x1, y1));
+            let blank = self.buf_is_blank_at(x0, y0, x1, y1);
+            {
+                let item = &mut self.items[i];
+                if hash != item.hash || blank {
+                    item.hash = hash;
+                    item.dirty = true;
+                    self.changed = true;
+                }
             }
+            self.accumulate(x0, y0, x1, y1, &bytes);
         }
     }
 
-    /// Alpha-composite the widget canvas' damaged region onto `dst` (the
-    /// wallpaper frame, BGRA, same dimensions). Uses the cached frame data
-    /// from render_tick — does not re-read the canvas.
-    pub fn composite_pending(&mut self, dst: &mut [u8]) {
-        let Some((x0, y0, x1, y1)) = self.pending else {
-            return;
-        };
-        let Some(frame) = &self.frame_data else {
-            return;
-        };
-        let bytes = &frame.4;
-        let _row = (x1 - x0) * 4;
-        let cw = self.canvas.dims().0;
+    /// True when the combined buffer holds no pixels in the given region
+    /// (i.e. this is the widget's very first output there).
+    fn buf_is_blank_at(&self, x0: usize, y0: usize, x1: usize, y1: usize) -> bool {
+        for dy in y0..y1.min(self.height) {
+            for dx in x0..x1.min(self.width) {
+                let o = (dy * self.width + dx) * 4 + 3;
+                if o < self.buf.len() && self.buf[o] != 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Blend one widget's premultiplied-BGRA region into the combined buffer.
+    fn accumulate(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, bytes: &[u8]) {
+        let cw = self.width;
+        let row = x1 - x0;
         let mut i = 0usize;
         for ri in 0..(y1 - y0) {
-            for ci in 0..(x1 - x0) {
+            for ci in 0..row {
                 let s0 = i;
                 i += 4;
                 let dx = x0 + ci;
@@ -539,22 +600,47 @@ impl WidgetHost {
                     continue;
                 }
                 let d = (dy * cw + dx) * 4;
-                if d + 4 > dst.len() {
+                if d + 4 > self.buf.len() {
                     continue;
                 }
                 let a = bytes[s0 + 3] as u32;
-                if a == 255 {
-                    dst[d] = bytes[s0];
-                    dst[d + 1] = bytes[s0 + 1];
-                    dst[d + 2] = bytes[s0 + 2];
-                } else {
-                    let inv = 255 - a;
-                    dst[d] = (bytes[s0] as u32 + dst[d] as u32 * inv / 255).min(255) as u8;
-                    dst[d + 1] =
-                        (bytes[s0 + 1] as u32 + dst[d + 1] as u32 * inv / 255).min(255) as u8;
-                    dst[d + 2] =
-                        (bytes[s0 + 2] as u32 + dst[d + 2] as u32 * inv / 255).min(255) as u8;
-                }
+                // src-over onto the accumulating buffer (which starts fully
+                // transparent, so opaque sources simply replace).
+                let inv = 255 - a;
+                self.buf[d] =
+                    (bytes[s0] as u32 + self.buf[d] as u32 * inv / 255).min(255) as u8;
+                self.buf[d + 1] =
+                    (bytes[s0 + 1] as u32 + self.buf[d + 1] as u32 * inv / 255).min(255) as u8;
+                self.buf[d + 2] =
+                    (bytes[s0 + 2] as u32 + self.buf[d + 2] as u32 * inv / 255).min(255) as u8;
+                self.buf[d + 3] = (a + self.buf[d + 3] as u32 * inv / 255)
+                    .min(255) as u8;
+            }
+        }
+    }
+
+    /// Alpha-composite the accumulated widget output onto `dst` (the wallpaper
+    /// frame, BGRA, same dimensions).
+    pub fn composite_pending(&mut self, dst: &mut [u8]) {
+        let n = dst.len().min(self.buf.len());
+        for d in (0..n).step_by(4) {
+            let s = d;
+            let a = self.buf[s + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            if a == 255 {
+                dst[d] = self.buf[s];
+                dst[d + 1] = self.buf[s + 1];
+                dst[d + 2] = self.buf[s + 2];
+            } else {
+                let inv = 255 - a;
+                dst[d] =
+                    (self.buf[s] as u32 + dst[d] as u32 * inv / 255).min(255) as u8;
+                dst[d + 1] =
+                    (self.buf[s + 1] as u32 + dst[d + 1] as u32 * inv / 255).min(255) as u8;
+                dst[d + 2] =
+                    (self.buf[s + 2] as u32 + dst[d + 2] as u32 * inv / 255).min(255) as u8;
             }
         }
     }
@@ -574,16 +660,14 @@ impl WidgetHost {
         let dir = widgets_dir(wallpaper_dir);
         ensure_sample(&dir);
 
+        let (cw, ch) = (size.0.max(1) as usize, size.1.max(1) as usize);
         let mut host = WidgetHost {
-            canvas: Pen::new(),
+            width: cw,
+            height: ch,
+            buf: vec![0u8; cw * ch * 4],
             items: Vec::new(),
-            last_run: Instant::now() - Duration::from_secs(1),
-            pending: None,
-            frame_data: None,
-            last_hash: 0,
             changed: false,
         };
-        host.canvas.set_region(size.0.max(1) as usize, size.1.max(1) as usize);
 
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return host;
@@ -601,15 +685,36 @@ impl WidgetHost {
                 .and_then(|s| s.to_str())
                 .unwrap_or("widget")
                 .to_string();
-            let res = (|| -> Result<(Engine, rhai::AST), String> {
+            let res = (|| -> Result<(Engine, rhai::AST, Duration), String> {
                 let src =
                     std::fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
                 let engine = make_engine();
                 let ast = engine.compile(src).map_err(|e| format!("compile: {e}"))?;
-                Ok((engine, ast))
+                // Scripts may pick their own update rate with `fn fps()`.
+                let fps = engine
+                    .call_fn::<i64>(&mut Scope::new(), &ast, "fps", ())
+                    .ok()
+                    .filter(|f| (1..=120).contains(f))
+                    .unwrap_or(WIDGET_FPS as i64);
+                let interval =
+                    Duration::from_millis((1000 / fps.max(1)).max(1) as u64);
+                Ok((engine, ast, interval))
             })();
             match res {
-                Ok((engine, ast)) => host.items.push(ScriptItem { name, engine, ast }),
+                Ok((engine, ast, interval)) => {
+                    let pen = Pen::new();
+                    pen.set_region(cw, ch);
+                    host.items.push(ScriptItem {
+                        name,
+                        engine,
+                        ast,
+                        interval,
+                        last_run: Instant::now() - Duration::from_secs(1),
+                        pen,
+                        hash: 0,
+                        dirty: false,
+                    })
+                }
                 Err(e) => crate::logger::log(&format!("widget {name}: {e}")),
             }
         }
@@ -653,6 +758,8 @@ fn make_engine() -> Engine {
     engine.register_fn("cpu", |p: &mut Pen| p.cpu_percent());
     engine.register_fn("ram", |p: &mut Pen| p.ram_percent());
     engine.register_fn("time", |p: &mut Pen, fmt: &str| p.time(fmt));
+    engine.register_fn("date", |p: &mut Pen| p.date("%a, %b %e"));
+    engine.register_fn("date", |p: &mut Pen, fmt: &str| p.date(fmt));
 
     // Drawing primitives
     engine.register_fn("arc", |p: &mut Pen, cx: i64, cy: i64, r: i64, start: f64, sweep: f64, t: i64, color: &str| {
@@ -696,6 +803,21 @@ fn make_engine() -> Engine {
             p.draw_image_impl(x, y, w, h, path);
         },
     );
+    engine.register_fn(
+        "svg",
+        |p: &mut Pen, x: i64, y: i64, w: i64, h: i64, path: &str| {
+            p.draw_svg_impl(x, y, w, h, path);
+        },
+    );
+    engine.register_fn(
+        "video",
+        |p: &mut Pen, x: i64, y: i64, w: i64, h: i64, path: &str| {
+            p.draw_video_impl(x, y, w, h, path);
+        },
+    );
+
+    // GPU utilisation
+    engine.register_fn("gpu", |p: &mut Pen| p.gpu_percent());
     engine
 }
 
@@ -806,6 +928,96 @@ fn http_cache() -> &'static Mutex<HttpCache> {
 fn image_cache() -> &'static Mutex<ImageCache> {
     static CACHE: OnceLock<Mutex<ImageCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+type VideoPlayers = HashMap<PathBuf, Arc<crate::video::VideoPlayer>>;
+
+/// One background decoder per video path used by widgets. Players keep
+/// looping their source forever; frames are fetched at draw time.
+fn video_players() -> &'static Mutex<VideoPlayers> {
+    static PLAYERS: OnceLock<Mutex<VideoPlayers>> = OnceLock::new();
+    PLAYERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get (or lazily open) the background player for a video file.
+fn video_player_for(
+    path: &Path,
+    target: Option<(u32, u32)>,
+) -> Option<Arc<crate::video::VideoPlayer>> {
+    let mut players = video_players().lock().unwrap();
+    if let Some(p) = players.get(path) {
+        return Some(p.clone());
+    }
+    let data = std::fs::read(path).ok()?;
+    let data = Arc::new(data);
+    // GPU decode first, software fallback — same policy as wallpapers.
+    let player = crate::video::VideoPlayer::open(data.clone(), target, true)
+        .or_else(|_| crate::video::VideoPlayer::open(data, target, false))
+        .ok()?;
+    let arc = Arc::new(player);
+    players.insert(path.to_path_buf(), arc.clone());
+    Some(arc)
+}
+
+type SvgCache = HashMap<(PathBuf, u32, u32), Arc<Vec<u8>>>;
+
+/// Render an SVG to straight RGBA at an exact size, cached per path+size.
+fn render_svg_cached(path: &Path, tw: u32, th: u32) -> Option<Arc<Vec<u8>>> {
+    {
+        let cache = svg_cache().lock().ok()?;
+        if let Some(rgba) = cache.get(&(path.to_path_buf(), tw, th)) {
+            return Some(rgba.clone());
+        }
+    }
+    let data = std::fs::read(path).ok()?;
+    let rgba = render_svg(&data, tw, th)?;
+    let arc = Arc::new(rgba);
+    if let Ok(mut cache) = svg_cache().lock() {
+        cache.insert((path.to_path_buf(), tw, th), arc.clone());
+    }
+    Some(arc)
+}
+
+fn svg_cache() -> &'static Mutex<SvgCache> {
+    static CACHE: OnceLock<Mutex<SvgCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Rasterise SVG bytes into straight-alpha RGBA pixels of size `(tw x th)`.
+fn render_svg(data: &[u8], tw: u32, th: u32) -> Option<Vec<u8>> {
+    use resvg::tiny_skia;
+    use resvg::usvg;
+
+    let opts = usvg::Options::default();
+    let tree = usvg::Tree::from_data(data, &opts).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(tw, th)?;
+    pixmap.fill(tiny_skia::Color::TRANSPARENT);
+
+    // Scale from the SVG's intrinsic size to the requested output size.
+    let size = tree.size();
+    let sx = tw as f32 / size.width().max(1.0);
+    let sy = th as f32 / size.height().max(1.0);
+    {
+        let mut view = pixmap.as_mut();
+        resvg::render(&tree, tiny_skia::Transform::from_scale(sx, sy), &mut view);
+    }
+
+    // tiny-skia stores premultiplied RGBA; convert to straight alpha for the
+    // shared blend helper.
+    let raw = pixmap.take();
+    let mut out = Vec::with_capacity(raw.len());
+    for px in raw.chunks_exact(4) {
+        let a = px[3] as u32;
+        if a == 0 || a == 255 {
+            out.extend_from_slice(px);
+        } else {
+            out.push((px[0] as u32 * 255 / a) as u8);
+            out.push((px[1] as u32 * 255 / a) as u8);
+            out.push((px[2] as u32 * 255 / a) as u8);
+            out.push(a as u8);
+        }
+    }
+    Some(out)
 }
 
 fn resolve_widget_path(path: &str) -> PathBuf {
@@ -950,6 +1162,51 @@ fn blend_rgba_at(pen: &Pen, x: i64, y: i64, w: usize, h: usize, rgba: &[u8]) {
             s.pixels[d + 3] = a as u8 + ((s.pixels[d + 3] as u16 * inv as u16) / 255) as u8;
         }
     }
+}
+
+/// Format a `SYSTEMTIME` using `strftime`-style specifiers:
+/// `%H %M %S %Y %m %d %e %p %a %A %b %B`.
+fn format_datetime(st: windows::Win32::Foundation::SYSTEMTIME, fmt: &str) -> String {
+    const WEEKDAYS_SHORT: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const WEEKDAYS_LONG: [&str; 7] = [
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    ];
+    const MONTHS_SHORT: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const MONTHS_LONG: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ];
+
+    let mut out = String::new();
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%' && i + 1 < chars.len() {
+            let piece = match chars[i + 1] {
+                'H' => format!("{:02}", st.wHour),
+                'M' => format!("{:02}", st.wMinute),
+                'S' => format!("{:02}", st.wSecond),
+                'Y' => format!("{}", st.wYear),
+                'm' => format!("{:02}", st.wMonth),
+                'd' => format!("{:02}", st.wDay),
+                'e' => format!("{:2}", st.wDay),
+                'p' => if st.wHour < 12 { "AM".into() } else { "PM".into() },
+                'a' => WEEKDAYS_SHORT[(st.wDayOfWeek as usize) % 7].into(),
+                'A' => WEEKDAYS_LONG[(st.wDayOfWeek as usize) % 7].into(),
+                'b' | 'h' => MONTHS_SHORT[(st.wMonth as usize).saturating_sub(1) % 12].into(),
+                'B' => MONTHS_LONG[(st.wMonth as usize).saturating_sub(1) % 12].into(),
+                other => format!("%{other}"),
+            };
+            out.push_str(&piece);
+            i += 2;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn parse_color(hex: &str) -> [u8; 4] {
