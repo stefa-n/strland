@@ -6,6 +6,7 @@ mod launcher;
 mod modes;
 mod power;
 mod switcher;
+mod themes;
 mod wallpaper;
 mod win;
 
@@ -63,10 +64,12 @@ fn island_viewport_size(
     power_open: bool,
     control_open: bool,
     wallpaper_open: bool,
+    themes_open: bool,
     switcher_active: bool,
     power_anim: f32,
     control_anim: f32,
     wallpaper_anim: f32,
+    themes_anim: f32,
 ) -> egui::Vec2 {
     if switcher_active {
         return egui::vec2(760.0, 520.0);
@@ -89,6 +92,9 @@ fn island_viewport_size(
     // Wallpaper panel growth below the pill.
     let wallpaper_width = closed_width.max(560.0 + 40.0);
     let wallpaper_height = cfg.border_radius + 8.0 + 420.0 + 24.0;
+    // Themes panel growth below the pill.
+    let themes_width = closed_width.max(560.0 + 40.0);
+    let themes_height = cfg.border_radius + 8.0 + 420.0 + 24.0;
     let tl = ease_out_cubic(launcher_anim);
     let th = ease_out_cubic(hover_anim);
     // Snap the window to full size immediately so the native window can't lag
@@ -96,6 +102,7 @@ fn island_viewport_size(
     let tp = if power_open { 1.0 } else { ease_out_cubic(power_anim) };
     let tc = if control_open { 1.0 } else { ease_out_cubic(control_anim) };
     let tw = if wallpaper_open { 1.0 } else { ease_out_cubic(wallpaper_anim) };
+    let tt = if themes_open { 1.0 } else { ease_out_cubic(themes_anim) };
     let w = lerp(lerp(closed_width, open_width, tl), hover_width, th);
     let h = lerp(lerp(closed_height, open_height, tl), hover_height, th);
     let w = lerp(w, power_width, tp);
@@ -104,6 +111,8 @@ fn island_viewport_size(
     let h = lerp(h, control_height, tc);
     let w = lerp(w, wallpaper_width, tw);
     let h = lerp(h, wallpaper_height, tw);
+    let w = lerp(w, themes_width, tt);
+    let h = lerp(h, themes_height, tt);
     egui::vec2(w, h)
 }
 
@@ -206,6 +215,7 @@ struct DynamicIslandApp {
     last_switcher_tab: u64,
 
     wallpaper: wallpaper::WallpaperState,
+    themes: themes::ThemesState,
 
     control_open: bool,
     control_state: modes::ControlCenterState,
@@ -241,7 +251,7 @@ impl DynamicIslandApp {
         let hwnd = None;
 
         let now = Instant::now();
-        let viewport_size = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, false, 0.0, 0.0, 0.0);
+        let viewport_size = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, false, false, 0.0, 0.0, 0.0, 0.0);
         let start_y = -(viewport_size.y + cfg.y_padding);
         let clock = formatted_clock(&cfg);
         let day = formatted_day();
@@ -293,6 +303,7 @@ impl DynamicIslandApp {
             switcher: switcher::SwitcherState::new(),
             last_switcher_tab: 0,
             wallpaper: wallpaper::WallpaperState::new(),
+            themes: themes::ThemesState::new(),
             control_open: false,
             control_state: modes::ControlCenterState::default(),
             control_icons: None,
@@ -306,7 +317,7 @@ impl DynamicIslandApp {
     }
 
     fn sync_viewport_size(&mut self, ctx: &egui::Context) {
-        let desired = island_viewport_size(&self.cfg, self.launcher.anim, self.hover_anim, self.power.open, self.control_open, self.wallpaper.open, self.switcher.active || self.switcher.anim > 0.001, self.power.anim, self.control_anim, self.wallpaper.anim);
+        let desired = island_viewport_size(&self.cfg, self.launcher.anim, self.hover_anim, self.power.open, self.control_open, self.wallpaper.open, self.themes.open, self.switcher.active || self.switcher.anim > 0.001, self.power.anim, self.control_anim, self.wallpaper.anim, self.themes.anim);
         if desired == self.viewport_size {
             return;
         }
@@ -599,7 +610,6 @@ impl DynamicIslandApp {
                 bt: render_svg_texture(ctx, "cc-bt", BLUETOOTH_SVG, icon_px),
                 moon: render_svg_texture(ctx, "cc-moon", CONTROL_MOON_SVG, icon_px),
                 night: render_svg_texture(ctx, "cc-night", CONTROL_NIGHT_SVG, icon_px),
-                sun: render_svg_texture(ctx, "cc-sun", CONTROL_SUN_SVG, icon_px),
                 power: render_svg_texture(ctx, "cc-power", POWER_OFF_SVG, icon_px),
             });
         }
@@ -845,6 +855,9 @@ impl eframe::App for DynamicIslandApp {
         if self.wallpaper.open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.wallpaper.close();
         }
+        if self.themes.open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.themes.close();
+        }
         // Animate the menu's list of open/close and refresh the geometry.
         let power_target = if self.power.open { 1.0 } else { 0.0 };
         let (pa, _) = smooth_step(self.power.anim, power_target, dt, 9.0);
@@ -868,6 +881,14 @@ impl eframe::App for DynamicIslandApp {
         self.wallpaper.anim = wa;
         if !self.wallpaper.open && self.wallpaper.anim <= 0.001 {
             self.wallpaper.anim = 0.0;
+        }
+
+        // Animate the themes panel open/close.
+        let th_target = if self.themes.open { 1.0 } else { 0.0 };
+        let (tha, _) = smooth_step(self.themes.anim, th_target, dt, 9.0);
+        self.themes.anim = tha;
+        if !self.themes.open && self.themes.anim <= 0.001 {
+            self.themes.anim = 0.0;
         }
 
         // Clicking outside the app (window loses focus entirely) closes any
@@ -1414,6 +1435,24 @@ impl eframe::App for DynamicIslandApp {
                                     // No in-place connect available; close submenu.
                                     self.control_state.submenu = modes::ControlSubmenu::None;
                                 }
+                                modes::ControlAction::OpenWallpapers => {
+                                    self.control_open = false;
+                                    self.control_anim = 0.0;
+                                    self.control_state.submenu = modes::ControlSubmenu::None;
+                                    self.wallpaper.open = true;
+                                    if self.wallpaper.open {
+                                        self.wallpaper.refresh();
+                                    }
+                                }
+                                modes::ControlAction::OpenThemes => {
+                                    self.control_open = false;
+                                    self.control_anim = 0.0;
+                                    self.control_state.submenu = modes::ControlSubmenu::None;
+                                    self.themes.open = true;
+                                    if self.themes.open {
+                                        self.themes.refresh();
+                                    }
+                                }
                             }
                         }
                     });
@@ -1472,6 +1511,40 @@ impl eframe::App for DynamicIslandApp {
             }
         }
 
+        // --- Themes panel ---
+        if self.themes.anim > 0.001 {
+            let te = ease_out_cubic(self.themes.anim);
+            let th_width = 560.0f32.min(viewport_rect.width() - 40.0);
+            let th_height = 420.0f32;
+            let target = egui::Rect::from_min_size(
+                egui::pos2(viewport_rect.center().x - th_width / 2.0, pill_rect.top()),
+                egui::vec2(th_width, th_height),
+            );
+            let panel = lerp_rect(pill_rect, target, te);
+            let accent = Config::parse_color(&self.cfg.accent_color);
+            let mut picked_theme: Option<String> = None;
+            egui::Area::new(egui::Id::new("themes_panel"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(panel.min)
+                .movable(false)
+                .show(ctx, |ui| {
+                    if let Some(name) = self.themes.draw(ui, panel, &self.cfg, accent, te) {
+                        picked_theme = Some(name);
+                    }
+                });
+            let click_outside = ctx.input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer.interact_pos().map(|p| !target.contains(p)).unwrap_or(false)
+            });
+            if click_outside {
+                self.themes.close();
+            } else if let Some(name) = picked_theme {
+                win::apply_theme(&name);
+                self.cfg = Config::load();
+                self.themes.close();
+            }
+        }
+
         // --- Alt+Tab app switcher overlay ---
         // Render while active OR animating out, growing from the pill to a
         // centered panel.
@@ -1509,8 +1582,9 @@ impl eframe::App for DynamicIslandApp {
         let power_animating = self.power.anim > 0.001 && self.power.anim < 0.999;
         let control_animating = self.control_anim > 0.001 && self.control_anim < 0.999;
         let wallpaper_animating = self.wallpaper.anim > 0.001 && self.wallpaper.anim < 0.999;
+        let themes_animating = self.themes.anim > 0.001 && self.themes.anim < 0.999;
         let switcher_animating = self.switcher.active || (self.switcher.anim > 0.001 && self.switcher.anim < 0.999);
-        let animating = self.y_animating || self.width_animating || launcher_animating || hover_animating || power_animating || control_animating || switcher_animating || wallpaper_animating;
+        let animating = self.y_animating || self.width_animating || launcher_animating || hover_animating || power_animating || control_animating || switcher_animating || wallpaper_animating || themes_animating;
         let viz_active = self.visualizer_visibility > 0.01;
         let notification_active = self.mode == IslandMode::Notification;
         // A marquee-scrolling media title needs continuous repaints even after
@@ -1589,7 +1663,6 @@ const POWER_LOGOUT_SVG: &str = include_str!("assets/power_logout.svg");
 const POWER_REBOOT_SVG: &str = include_str!("assets/power_reboot.svg");
 const POWER_OFF_SVG: &str = include_str!("assets/power_off.svg");
 const CONTROL_AUDIO_SVG: &str = include_str!("assets/control_audio.svg");
-const CONTROL_SUN_SVG: &str = include_str!("assets/control_sun.svg");
 const CONTROL_MOON_SVG: &str = include_str!("assets/control_moon.svg");
 const CONTROL_NIGHT_SVG: &str = include_str!("assets/control_night.svg");
 
@@ -1666,7 +1739,11 @@ fn main() -> eframe::Result {
     // Start notification listener (reads Windows toast notifications)
     win::start_notification_listener();
 
-    let viewport = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, false, 0.0, 0.0, 0.0);
+    // Reset the work area so maximised apps fill the whole screen
+    // (needed when Explorer/taskbar is not running).
+    win::reset_work_area();
+
+    let viewport = island_viewport_size(&cfg, 0.0, 0.0, false, false, false, false, false, 0.0, 0.0, 0.0, 0.0);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([viewport.x, viewport.y])

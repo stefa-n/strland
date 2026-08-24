@@ -566,7 +566,7 @@ unsafe fn decode_sample(
     let (w, h) = (width as usize, height as usize);
 
     // Output size: the requested monitor size, clamped to the source (never
-    // upscale: it wastes CPU and adds nothing for a wallpaper).
+    // upscale — it wastes CPU and adds nothing for a wallpaper).
     let (out_w, out_h) = match target {
         Some((tw, th)) if tw > 0 && th > 0 => ((tw as usize).min(w), (th as usize).min(h)),
         _ => (w, h),

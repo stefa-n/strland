@@ -400,6 +400,50 @@ fn get_volume_legacy() -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Work area reset – tell Windows the entire monitor is available
+// ---------------------------------------------------------------------------
+
+/// Reset the Windows work area to cover the entire primary monitor.
+/// This is needed when Explorer.exe/taskbar is not running, so apps
+/// maximise to the full screen instead of leaving a gap at the bottom.
+#[cfg(target_os = "windows")]
+pub fn reset_work_area() {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SystemParametersInfoW,
+        SM_CXSCREEN, SM_CYSCREEN, SPI_SETWORKAREA, SPIF_SENDCHANGE,
+    };
+
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+
+    if width <= 0 || height <= 0 {
+        debug_log("[workarea] GetSystemMetrics returned invalid dimensions");
+        return;
+    }
+
+    let work_area = RECT { left: 0, top: 0, right: width, bottom: height };
+
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_SETWORKAREA,
+            0,
+            Some(&work_area as *const RECT as *mut _),
+            SPIF_SENDCHANGE,
+        )
+    };
+
+    if ok.is_ok() {
+        debug_log(&format!("[workarea] reset to 0,0 → {}×{}", width, height));
+    } else {
+        debug_log(&format!("[workarea] SystemParametersInfoW failed: {:?}", ok));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn reset_work_area() {}
+
+// ---------------------------------------------------------------------------
 // Media playing – runs on a background thread to avoid blocking the UI
 // ---------------------------------------------------------------------------
 
@@ -2540,6 +2584,189 @@ pub fn set_wallpaper(name: &str) -> bool {
     let content = format!("wallpaper = \"{name}\"\n");
     std::fs::write(&path, content).is_ok()
 }
+
+// ---------------------------------------------------------------------------
+// Themes - %USERPROFILE%\.strland\strbar\themes\
+// ---------------------------------------------------------------------------
+
+/// The themes directory (created if missing).
+#[cfg(target_os = "windows")]
+pub fn themes_dir() -> std::path::PathBuf {
+    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
+    let dir = std::path::PathBuf::from(home).join(".strland").join("strbar").join("themes");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// A theme entry: filename (without extension) and display name.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct ThemeEntry {
+    pub file_name: String,
+    pub display_name: String,
+    pub accent_color: Option<String>,
+    pub background: Option<String>,
+    pub wallpaper: Option<String>,
+}
+
+/// Lists theme entries in the themes directory.
+/// Each theme is a subdirectory containing a `theme.toml` file.
+#[cfg(target_os = "windows")]
+pub fn list_themes() -> Vec<ThemeEntry> {
+    let dir = themes_dir();
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if !ft.is_dir() { continue; }
+            let stem = e.file_name().to_string_lossy().to_string();
+            let theme_config = e.path().join("theme.toml");
+            if !theme_config.exists() { continue; }
+            let text = std::fs::read_to_string(&theme_config).unwrap_or_default();
+            let accent_color = extract_toml_string(&text, "accent_color");
+            let background = extract_toml_string(&text, "background");
+            let wallpaper = extract_toml_string(&text, "wallpaper");
+            let display_name = extract_toml_string(&text, "name").unwrap_or_else(|| stem.clone());
+            out.push(ThemeEntry { file_name: stem, display_name, accent_color, background, wallpaper });
+        }
+    }
+    out.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+    out
+}
+
+/// Applies a theme: writes all theme config fields to config.toml,
+/// wallpaper to strpaper/config.toml, and copies widgets if present.
+/// Returns true on success.
+#[cfg(target_os = "windows")]
+pub fn apply_theme(name: &str) -> bool {
+    let theme_dir = themes_dir().join(name);
+    let theme_config = theme_dir.join("theme.toml");
+    let theme_text = match std::fs::read_to_string(&theme_config) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    // Extract known fields from theme.toml
+    let accent = extract_toml_string(&theme_text, "accent_color");
+    let bg = extract_toml_string(&theme_text, "background");
+    let wp = extract_toml_string(&theme_text, "wallpaper");
+    let font = extract_toml_string(&theme_text, "font");
+    let font_size = extract_toml_float(&theme_text, "font_size");
+    let width = extract_toml_float(&theme_text, "width");
+    let height = extract_toml_float(&theme_text, "height");
+    let border_radius = extract_toml_float(&theme_text, "border_radius");
+    let clock_format = extract_toml_string(&theme_text, "clock_format");
+    let text_offset_y = extract_toml_float(&theme_text, "text_offset_y");
+    let launcher_highlight = extract_toml_string(&theme_text, "launcher_highlight");
+    let launcher_background = extract_toml_string(&theme_text, "launcher_background");
+    let status_button_background = extract_toml_string(&theme_text, "status_button_background");
+
+    // Apply wallpaper
+    if let Some(wp_name) = &wp {
+        set_wallpaper(wp_name);
+    }
+
+    // Apply config overrides — read current config, update matching keys, write back
+    let config_path = {
+        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
+        std::path::PathBuf::from(home).join(".strland").join("strbar").join("config.toml")
+    };
+    let mut changed = false;
+    if let Ok(text) = std::fs::read_to_string(&config_path) {
+        let mut lines: Vec<String> = text.lines().map(String::from).collect();
+
+        macro_rules! update_str {
+            ($key:expr, $val:expr) => {
+                if let Some(v) = &$val {
+                    if let Some(pos) = lines.iter().position(|l| l.starts_with(concat!($key, " "))) {
+                        lines[pos] = format!("{} = \"{}\"", $key, v);
+                    } else {
+                        lines.push(format!("{} = \"{}\"", $key, v));
+                    }
+                    changed = true;
+                }
+            };
+        }
+        macro_rules! update_float {
+            ($key:expr, $val:expr) => {
+                if let Some(v) = $val {
+                    if let Some(pos) = lines.iter().position(|l| l.starts_with(concat!($key, " "))) {
+                        lines[pos] = format!("{} = {}", $key, v);
+                    } else {
+                        lines.push(format!("{} = {}", $key, v));
+                    }
+                    changed = true;
+                }
+            };
+        }
+
+        update_str!("accent_color", accent);
+        update_str!("background", bg);
+        update_str!("font", font);
+        update_float!("font_size", font_size);
+        update_float!("width", width);
+        update_float!("height", height);
+        update_float!("border_radius", border_radius);
+        update_str!("clock_format", clock_format);
+        update_float!("text_offset_y", text_offset_y);
+        update_str!("launcher_highlight", launcher_highlight);
+        update_str!("launcher_background", launcher_background);
+        update_str!("status_button_background", status_button_background);
+
+        if changed {
+            let _ = std::fs::write(&config_path, lines.join("\n"));
+        }
+    }
+
+    // Copy widgets from theme to strpaper/widgets (if the theme has any)
+    let theme_widgets = theme_dir.join("widgets");
+    if theme_widgets.is_dir() {
+        let strpaper_widgets = wallpaper_dir().join("widgets");
+        let _ = std::fs::create_dir_all(&strpaper_widgets);
+        if let Ok(entries) = std::fs::read_dir(&theme_widgets) {
+            for e in entries.flatten() {
+                let Ok(ft) = e.file_type() else { continue };
+                if !ft.is_file() { continue; }
+                let dest = strpaper_widgets.join(e.file_name());
+                let _ = std::fs::copy(e.path(), dest);
+            }
+        }
+        debug_log(&format!("[theme] '{}' widgets copied to strpaper", name));
+    }
+
+    changed
+}
+
+fn extract_toml_float(text: &str, key: &str) -> Option<f32> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        if !k.trim().eq_ignore_ascii_case(key) { continue; }
+        let v = v.trim();
+        if let Ok(n) = v.parse::<f32>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn extract_toml_string(text: &str, key: &str) -> Option<String> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        if !k.trim().eq_ignore_ascii_case(key) { continue; }
+        let v = v.trim().trim_matches('"').trim();
+        if !v.is_empty() { return Some(v.to_string()); }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn list_themes() -> Vec<ThemeEntry> { Vec::new() }
+#[cfg(not(target_os = "windows"))]
+pub fn apply_theme(_name: &str) -> bool { false }
 
 // ---------------------------------------------------------------------------
 // Alt+Tab - enumerate top-level windows (for the custom app switcher)

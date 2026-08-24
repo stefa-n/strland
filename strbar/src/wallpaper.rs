@@ -88,7 +88,7 @@ impl WallpaperState {
         self.current = Some(name.to_string());
     }
 
-    fn refresh(&mut self) {
+    pub fn refresh(&mut self) {
         self.wallpapers = win::list_wallpapers();
         self.current = win::current_wallpaper();
         self.loaded = true;

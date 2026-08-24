@@ -65,6 +65,34 @@ deterministically:
 3. If those still tie, the file path is compared lexicographically so the
    result is fully deterministic.
 
+## Widgets
+
+Scripts in `%USERPROFILE%\.strland\strpaper\widgets\*.rhai` run at ~30fps and
+draw onto a shared transparent canvas composited over the wallpaper. They sit
+above the wallpaper and below the desktop icons and all app windows.
+
+```rhai
+fn draw(pen) {
+    pen.clear();
+    pen.text(24, 24, "Hello!", 28, "#FFFFFF");
+}
+```
+
+### Pen API
+
+| Category | Methods |
+|----------|---------|
+| Drawing | `clear`, `fill_rect`, `fill_round_rect`, `fill_circle`, `circle`, `arc`, `line`, `text` |
+| System | `battery`, `charging`, `bt_count`, `bt_level(i)`, `bt_name(i)`, `cpu`, `ram` |
+| Audio | `audio_level(pos)`, `media_playing` |
+| Network | `http_get(url)`, `http_download(url, path)` |
+| Process | `run(cmd)` |
+| Images | `image(x, y, w, h, path)` |
+| Time | `time(fmt)`, `width`, `height` |
+
+Colours: `"#RGB"`, `"#RRGGBB"`, `"#RRGGBBAA"` (alpha composites over the
+wallpaper).
+
 ## Hot reload
 
 The wallpaper directory is watched for changes:

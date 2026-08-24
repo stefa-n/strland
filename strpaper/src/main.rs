@@ -22,6 +22,7 @@ mod gpu;
 mod logger;
 mod render;
 mod storage;
+mod sysdata;
 mod video;
 mod watch;
 mod widgets;
@@ -123,6 +124,11 @@ fn main() {
         }
     };
 
+    // Start audio spectrum poller (WASAPI loopback + FFT for widget visualizer)
+    sysdata::start_audio_spectrum_poller();
+    // Start media poller (WinRT SMTC for now-playing info)
+    sysdata::start_media_poller();
+
     let mut app = App {
         dir,
         watcher,
@@ -167,7 +173,8 @@ struct App {
     motion: bool,
     timer_ms: u32,
     monitors: Vec<Monitor>,
-    origin: (i32, i32),
+    origin: (i32, i32),
+
     /// Version of the last video frame we painted (skip redundant repaints).
     painted_version: u64,
     /// Path of the currently loaded video, for GPU->software fallback.
@@ -476,10 +483,13 @@ impl App {
         if std::env::var("STRPAPER_NO_WIDGETS").is_ok() {
             return;
         }
-        let size = (self.monitors.iter().map(|m| m.width).sum::<i32>().max(1) as u32,
-                    self.monitors.iter().map(|m| m.height).sum::<i32>().max(1) as u32);
-        self.widget_host =
-            Some(widgets::WidgetHost::rebuild(size, &self.dir));
+        // Canvas must match the raster size (per-monitor target size).
+        let size = match self.monitors.first() {
+            Some(m) => (m.width as u32, m.height as u32),
+            None => return,
+        };
+        let host = widgets::WidgetHost::rebuild(size, &self.dir);
+        self.widget_host = Some(host);
     }
 
     fn widgets_watcher_dirty(&mut self) -> bool {
@@ -618,9 +628,21 @@ impl App {
         }
 
         // Run widget scripts while visible (they feed the shared canvas).
+        // Wrapped in catch_unwind: a panic here (inside the WndProc) would
+        // otherwise abort the process (extern "system" can't unwind).
         if !self.render_paused {
             if let Some(host) = &mut self.widget_host {
-                host.render_tick();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    host.render_tick();
+                }));
+                if let Err(panic_val) = result {
+                    let msg = panic_val
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_val.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    log(&format!("widget render panic: {msg}"));
+                }
                 if host.has_changes() {
                     self.invalidate();
                 }
@@ -719,14 +741,31 @@ impl App {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
             if let Some(raster) = frame_at(wallpaper, self.frame_start.elapsed()) {
+                // When the raster is smaller than the widget canvas (software
+                // decode with quality cap), scale it up so the canvas aligns.
+                let raster_ref;
+                let scaled;
+                if let Some(host) = &self.widget_host {
+                    if let Some((cw, ch)) = host.canvas_dims() {
+                        if raster.width != cw || raster.height != ch {
+                            scaled = render::fit_cover(&raster, cw, ch, false);
+                            raster_ref = &scaled;
+                        } else {
+                            raster_ref = raster.as_ref();
+                        }
+                    } else {
+                        raster_ref = raster.as_ref();
+                    }
+                } else {
+                    raster_ref = raster.as_ref();
+                }
                 // Composite widgets over the wallpaper frame when the widget
-                // canvas matches the raster dimensions (both are desktop-sized
-                // for videos and pre-fitted stills).
+                // canvas matches the raster dimensions.
                 let mut composited: Option<render::Raster> = None;
                 if let Some(host) = &mut self.widget_host {
                     if let Some((cw, ch)) = host.canvas_dims() {
-                        if raster.width == cw && raster.height == ch {
-                            let mut frame = raster.bgra.clone();
+                        if raster_ref.width == cw && raster_ref.height == ch {
+                            let mut frame = raster_ref.bgra.clone();
                             host.composite_pending(frame.as_mut_slice());
                             composited = Some(render::Raster {
                                 width: cw,
@@ -741,7 +780,7 @@ impl App {
                         render::paint_frame(hdc, &self.monitors, self.origin, frame);
                     }
                     None => {
-                        render::paint_frame(hdc, &self.monitors, self.origin, raster.as_ref());
+                        render::paint_frame(hdc, &self.monitors, self.origin, raster_ref);
                     }
                 }
             } else {

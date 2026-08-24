@@ -10,7 +10,6 @@ pub struct ControlCenterIcons {
     pub bt: egui::TextureHandle,
     pub moon: egui::TextureHandle,
     pub night: egui::TextureHandle,
-    pub sun: egui::TextureHandle,
     pub power: egui::TextureHandle,
 }
 
@@ -35,6 +34,8 @@ pub enum ControlAction {
     ToggleNightLight,
     SetDefaultAudio(String),
     ConnectWifi(String),
+    OpenWallpapers,
+    OpenThemes,
 }
 
 /// Mutable state for the control-center toggles (persisted across frames).
@@ -359,20 +360,37 @@ pub fn draw_control_center(
         actions.push(ControlAction::OpenSubmenu(ControlSubmenu::Power));
     }
 
-    // Volume + brightness sliders.
-    let y3 = y2 + tile_h + gap;
+    // Wallpapers + Themes row (under Night Light / Power).
+    let y_pills = y2 + tile_h + gap;
+    let pill_w = (content_w - gap) / 2.0;
+    let pill_h = tile_h;
+    let wp_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + pad, y_pills),
+        egui::vec2(pill_w, pill_h),
+    );
+    let th_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + pad + pill_w + gap, y_pills),
+        egui::vec2(pill_w, pill_h),
+    );
+    let wp_zone = tile(ui, wp_rect, "Wallpapers", "Pick wallpaper", None, accent, 1.0, false);
+    if wp_zone != TileZone::None {
+        actions.push(ControlAction::OpenWallpapers);
+    }
+    let th_zone = tile(ui, th_rect, "Themes", "Switch theme", None, accent, 1.0, false);
+    if th_zone != TileZone::None {
+        actions.push(ControlAction::OpenThemes);
+    }
+
+    // Volume slider.
+    let y3 = y_pills + pill_h + gap;
     let slider_h = 40.0;
     let mut vol = volume;
     slider_row(ui, y3, rect.left() + pad, content_w, slider_h, Some(&icons.audio), accent, vol, "volume", |v| vol = v);
     win::set_volume(vol);
 
-    let y4 = y3 + slider_h + gap;
-    let mut bright = 0.8f32;
-    slider_row(ui, y4, rect.left() + pad, content_w, slider_h, Some(&icons.sun), accent, bright, "brightness", |v| bright = v);
-
     // Submenu area (appears when a tile's text is tapped).
     if state.submenu != ControlSubmenu::None {
-        let y5 = y4 + slider_h + gap;
+        let y5 = y3 + slider_h + gap;
         let sub_rect = egui::Rect::from_min_size(
             egui::pos2(rect.left() + pad, y5),
             egui::vec2(content_w, 220.0),
@@ -412,7 +430,7 @@ pub fn draw_control_center(
     } else {
         // Media card.
         if let Some((art, title, artist)) = media {
-            let y5 = y4 + slider_h + gap;
+            let y5 = y3 + slider_h + gap;
             let card = egui::Rect::from_min_size(
                 egui::pos2(rect.left() + pad, y5),
                 egui::vec2(content_w, 96.0),

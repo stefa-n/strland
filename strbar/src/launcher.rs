@@ -4,6 +4,8 @@ use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 #[derive(Clone, Debug)]
 pub struct AppEntry {
@@ -483,7 +485,7 @@ fn scan_start_menu_dir(dir: &Path, apps: &mut Vec<AppEntry>, dedupe: &mut HashSe
 }
 
 fn scan_registry_app_paths(root: &str, apps: &mut Vec<AppEntry>, dedupe: &mut HashSet<String>) {
-    let Ok(output) = Command::new("reg").args(["query", root, "/s"]).output() else {
+    let Ok(output) = Command::new("reg").args(["query", root, "/s"]).creation_flags(0x08000000).output() else {
         return;
     };
     if !output.status.success() {

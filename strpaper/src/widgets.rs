@@ -195,6 +195,71 @@ impl Pen {
 
 // Script-facing methods.
 impl Pen {
+    /// Draw an arc (partial circle outline) centred at (cx, cy).
+    /// `start_deg` and `sweep_deg` are in degrees; 0° = right, 90° = down.
+    pub fn arc(&mut self, cx: i64, cy: i64, r: i64, start_deg: f64, sweep_deg: f64, thickness: i64, c: [u8; 4]) {
+        let steps = ((sweep_deg.abs() as i64).max(4) * 2) as usize;
+        let half = (thickness.max(1) / 2) as i64;
+        let rf = r as f64;
+        for i in 0..steps {
+            let angle = (start_deg + sweep_deg * (i as f64 / steps as f64)).to_radians();
+            let px = cx + (rf * angle.cos()) as i64;
+            let py = cy + (rf * angle.sin()) as i64;
+            self.fill_solid(px - half, py - half, thickness.max(1), thickness.max(1), c);
+        }
+    }
+
+    /// Draw a circle outline.
+    pub fn circle(&mut self, cx: i64, cy: i64, r: i64, thickness: i64, c: [u8; 4]) {
+        self.arc(cx, cy, r, 0.0, 360.0, thickness, c);
+    }
+
+    /// Draw a filled circle.
+    pub fn fill_circle(&mut self, cx: i64, cy: i64, r: i64, c: [u8; 4]) {
+        let rf = r as f64;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if (dx * dx + dy * dy) as f64 <= rf * rf {
+                    self.blend_px((cx + dx) as usize, (cy + dy) as usize, premul_bgra(c));
+                }
+            }
+        }
+    }
+
+    /// Draw a rounded rectangle (filled).
+    pub fn fill_round_rect(&mut self, x: i64, y: i64, w: i64, h: i64, radius: i64, c: [u8; 4]) {
+        // Main body
+        self.fill_solid(x, y + radius, w, h - radius * 2, c);
+        // Top and bottom strips
+        self.fill_solid(x + radius, y, w - radius * 2, radius, c);
+        self.fill_solid(x + radius, y + h - radius, w - radius * 2, radius, c);
+        // Corner arcs (filled circles at corners, clipped by surrounding fills)
+        let rf = radius as f64;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let dist = ((dx * dx + dy * dy) as f64).sqrt();
+                if dist <= rf {
+                    // Top-left corner
+                    if x + radius + dx >= x && y + radius + dy >= y && dx < 0 && dy < 0 {
+                        self.fill_solid(x + radius + dx, y + radius + dy, 1, 1, c);
+                    }
+                    // Top-right
+                    if x + w - radius + dx < x + w && y + radius + dy >= y && dx >= 0 && dy < 0 {
+                        self.fill_solid(x + w - radius + dx, y + radius + dy, 1, 1, c);
+                    }
+                    // Bottom-left
+                    if x + radius + dx >= x && y + h - radius + dy < y + h && dx < 0 && dy >= 0 {
+                        self.fill_solid(x + radius + dx, y + h - radius + dy, 1, 1, c);
+                    }
+                    // Bottom-right
+                    if x + w - radius + dx < x + w && y + h - radius + dy < y + h && dx >= 0 && dy >= 0 {
+                        self.fill_solid(x + w - radius + dx, y + h - radius + dy, 1, 1, c);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         let mut s = self.inner.lock().unwrap();
         s.pixels.iter_mut().for_each(|b| *b = 0);
@@ -249,6 +314,48 @@ impl Pen {
                 0
             }
         }
+    }
+
+    fn battery(&mut self) -> i64 {
+        crate::sysdata::battery().percent
+    }
+
+    fn charging(&mut self) -> bool {
+        crate::sysdata::battery().charging
+    }
+
+    fn bt_count(&mut self) -> i64 {
+        crate::sysdata::bt_devices().len() as i64
+    }
+
+    fn bt_level(&mut self, index: i64) -> i64 {
+        let devices = crate::sysdata::bt_devices();
+        devices.get(index as usize).map(|d| d.level).unwrap_or(-1)
+    }
+
+    fn bt_name(&mut self, index: i64) -> String {
+        let devices = crate::sysdata::bt_devices();
+        devices.get(index as usize).map(|d| d.name.clone()).unwrap_or_default()
+    }
+
+    fn audio_level(&mut self, pos: f64) -> i64 {
+        let bands = crate::sysdata::audio_bands();
+        let idx = (pos.clamp(0.0, 1.0) * (bands.len() - 1) as f64).round() as usize;
+        (bands[idx].clamp(0.0, 1.0) * 100.0) as i64
+    }
+
+    fn media_playing(&mut self) -> bool {
+        crate::sysdata::media_info().playing
+    }
+
+    #[allow(dead_code)]
+    fn media_title(&mut self) -> String {
+        crate::sysdata::media_info().title
+    }
+
+    #[allow(dead_code)]
+    fn media_artist(&mut self) -> String {
+        crate::sysdata::media_info().artist
     }
 
     fn time(&mut self, fmt: &str) -> String {
@@ -353,6 +460,16 @@ impl WidgetHost {
         }
     }
 
+    /// Number of loaded scripts.
+    pub fn script_count(&self) -> usize {
+        self.items.len()
+    }
+
+    /// True when there is a pending composite frame.
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// True when visible output differs from what is currently displayed.
     pub fn has_changes(&self) -> bool {
         self.changed
@@ -367,34 +484,33 @@ impl WidgetHost {
             return;
         }
         self.last_run = Instant::now();
+
+        // Clear the canvas so scripts draw on a fresh surface each frame.
+        self.canvas.clear();
+
         let mut scope = Scope::new();
+
+        // Run ALL scripts first — they share one canvas and each contributes
+        // to the combined output.
         for item in &self.items {
             let pen = self.canvas.clone();
             if let Err(e) =
-                item.engine.call_fn::<()>(&mut scope, &item.ast, "draw", (pen.clone(),))
+                item.engine.call_fn::<()>(&mut scope, &item.ast, "draw", (pen,))
             {
                 crate::logger::log(&format!("widget {}: script error: {e}", item.name));
             }
-            drop(pen);
+        }
 
-            // Track damage; identical redraws do not trigger invalidation.
-            if let Some((x0, y0, x1, y1, bytes)) = self.canvas.take_frame() {
-                let hash = fnv_hash(&bytes);
-                if self.last_hash != hash || self.pending.is_none() {
-                    self.changed = true;
-                    self.last_hash = hash;
-                    self.frame_data =
-                        Some((x0, y0, x1, y1, bytes));
-                    self.pending = Some(match self.pending {
-                        Some((a0, a1, a2, a3)) => (
-                            a0.min(x0),
-                            a1.min(y0),
-                            a2.max(x1),
-                            a3.max(y1),
-                        ),
-                        None => (x0, y0, x1, y1),
-                    });
-                }
+        // Now capture the combined damage from all scripts in ONE take_frame
+        // call so no widget's contribution is lost.
+        if let Some((x0, y0, x1, y1, bytes)) = self.canvas.take_frame() {
+            let hash = fnv_hash(&bytes);
+            if self.last_hash != hash || self.pending.is_none() {
+                self.changed = true;
+                self.last_hash = hash;
+                self.frame_data =
+                    Some((x0, y0, x1, y1, bytes));
+                self.pending = Some((x0, y0, x1, y1));
             }
         }
     }
@@ -537,6 +653,35 @@ fn make_engine() -> Engine {
     engine.register_fn("cpu", |p: &mut Pen| p.cpu_percent());
     engine.register_fn("ram", |p: &mut Pen| p.ram_percent());
     engine.register_fn("time", |p: &mut Pen, fmt: &str| p.time(fmt));
+
+    // Drawing primitives
+    engine.register_fn("arc", |p: &mut Pen, cx: i64, cy: i64, r: i64, start: f64, sweep: f64, t: i64, color: &str| {
+        p.arc(cx, cy, r, start, sweep, t, parse_color(color));
+    });
+    engine.register_fn("circle", |p: &mut Pen, cx: i64, cy: i64, r: i64, t: i64, color: &str| {
+        p.circle(cx, cy, r, t, parse_color(color));
+    });
+    engine.register_fn("fill_circle", |p: &mut Pen, cx: i64, cy: i64, r: i64, color: &str| {
+        p.fill_circle(cx, cy, r, parse_color(color));
+    });
+    engine.register_fn("fill_round_rect", |p: &mut Pen, x: i64, y: i64, w: i64, h: i64, r: i64, color: &str| {
+        p.fill_round_rect(x, y, w, h, r, parse_color(color));
+    });
+
+    // Battery
+    engine.register_fn("battery", |p: &mut Pen| p.battery());
+    engine.register_fn("charging", |p: &mut Pen| p.charging());
+
+    // Bluetooth devices
+    engine.register_fn("bt_count", |p: &mut Pen| p.bt_count());
+    engine.register_fn("bt_level", |p: &mut Pen, i: i64| p.bt_level(i));
+    engine.register_fn("bt_name", |p: &mut Pen, i: i64| p.bt_name(i));
+
+    // Audio / Media
+    engine.register_fn("audio_level", |p: &mut Pen, pos: f64| p.audio_level(pos));
+    engine.register_fn("media_playing", |p: &mut Pen| p.media_playing());
+    engine.register_fn("media_title", |p: &mut Pen| p.media_title());
+    engine.register_fn("media_artist", |p: &mut Pen| p.media_artist());
 
     // HTTP / Process / Image
     engine.register_fn("http_get", |p: &mut Pen, url: &str| p.http_get_impl(url));
@@ -824,6 +969,17 @@ fn parse_color(hex: &str) -> [u8; 4] {
         }
         _ => [255, 255, 255, 255],
     }
+}
+
+/// Convert RGBA colour to premultiplied BGRA for the canvas buffer.
+fn premul_bgra(c: [u8; 4]) -> [u8; 4] {
+    let a = c[3] as u16;
+    [
+        ((c[2] as u16 * a) / 255) as u8, // B premultiplied
+        ((c[1] as u16 * a) / 255) as u8, // G premultiplied
+        ((c[0] as u16 * a) / 255) as u8, // R premultiplied
+        c[3],
+    ]
 }
 
 static CPU_LAST: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
