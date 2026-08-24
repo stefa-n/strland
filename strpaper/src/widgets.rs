@@ -1,0 +1,873 @@
+//! Programmable desktop widgets.
+//!
+//! Every `.rhai` file in `%USERPROFILE%\.strland\strpaper\widgets\` contributes a
+//! `draw(pen)` function. All scripts draw into one shared desktop-sized
+//! canvas; damaged regions are detected, alpha-composited over the wallpaper
+//! frame, and only repainted when something visibly changed. Widgets live
+//! *inside* the wallpaper window: above the wallpaper, below icons/apps.
+//!
+//! ```rhai
+//! fn draw(pen) {
+//!     pen.clear();
+//!     pen.text(24, 24, "Hello!", 28, "#FFFFFF");
+//! }
+//! ```
+//!
+//! Pen API: `clear`, `fill_rect(x,y,w,h,color)`, `line(x1,y1,x2,y2,w,color)`,
+//! `text(x,y,str,size,color)`, `width`, `height`, `cpu`, `ram`, `time(fmt)`.
+//! Colours are `"#RGB"`, `"#RRGGBB"` or `"#RRGGBBAA"`; alpha blends over the
+//! wallpaper.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use rhai::{Engine, Scope};
+
+/// Frames per second widgets re-run their scripts at.
+const WIDGET_FPS: u64 = 30;
+
+pub const WIDGETS_DIR_NAME: &str = "widgets";
+
+/// Full path of the widgets directory (created if missing).
+pub fn widgets_dir(wallpaper_dir: &std::path::Path) -> std::path::PathBuf {
+    let dir = wallpaper_dir.join(WIDGETS_DIR_NAME);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Write an example widget so the feature is discoverable.
+pub fn ensure_sample(dir: &std::path::Path) {
+    let sample = dir.join("clock.rhai");
+    let empty = std::fs::read_dir(dir)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(true);
+    if empty && !sample.exists() {
+        let _ = std::fs::write(
+            &sample,
+            r###"// strpaper widget — runs ~30x per second.
+// Draw anywhere on the desktop with the `pen`.
+
+fn draw(pen) {
+    pen.clear();
+
+    // Clock
+    pen.text(48, 48, pen.time("%H:%M:%S"), 42, "#FFFFFF");
+
+    // CPU bar
+    let cpu = pen.cpu();
+    pen.fill_rect(48, 110, 260, 10, "#333333");
+    pen.fill_rect(48, 110, 260 * cpu / 100, 10, "#7AA2F7");
+
+    // RAM bar
+    let ram = pen.ram();
+    pen.fill_rect(48, 130, 260, 10, "#333333");
+    pen.fill_rect(48, 130, 260 * ram / 100, 10, "#9ECE6A");
+
+    pen.text(48, 152, "cpu " + cpu + "%   ram " + ram + "%", 16, "#A9B1D6");
+}
+"###,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pen
+// ---------------------------------------------------------------------------
+
+/// Shared drawing surface handed to scripts (premultiplied BGRA, top-down).
+#[derive(Clone)]
+pub struct Pen {
+    inner: Arc<Mutex<PenSurface>>,
+}
+
+#[derive(Default)]
+struct PenSurface {
+    w: usize,
+    h: usize,
+    pixels: Vec<u8>,
+    /// Damage rectangle since the last snapshot: (x0, y0, x1, y1).
+    bbox: Option<(usize, usize, usize, usize)>,
+}
+
+impl Pen {
+    fn new() -> Pen {
+        Pen {
+            inner: Arc::new(Mutex::new(PenSurface::default())),
+        }
+    }
+
+    fn set_region(&self, w: usize, h: usize) {
+        let mut s = self.inner.lock().unwrap();
+        if s.w != w || s.h != h {
+            s.w = w;
+            s.h = h;
+            s.pixels = vec![0u8; w * h * 4];
+            s.bbox = Some((0, 0, w, h));
+        }
+    }
+
+    /// `(w, h)` of the surface.
+    pub fn dims(&self) -> (usize, usize) {
+        let s = self.inner.lock().unwrap();
+        (s.w, s.h)
+    }
+
+    fn mark(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        let mut s = self.inner.lock().unwrap();
+        s.bbox = match (s.bbox, (x0, y0, x1, y1)) {
+            (None, cur) => Some(cur),
+            (Some((a0, a1, a2, a3)), (b0, b1, b2, b3)) => Some((
+                a0.min(b0),
+                a1.min(b1),
+                a2.max(b2),
+                a3.max(b3),
+            )),
+        };
+    }
+
+    /// Snapshot the canvas bytes and clear damage tracking. Returns
+    /// `(x0, y0, x1, y1, bytes)` or `None` when nothing was drawn.
+    fn take_frame(&mut self) -> Option<(usize, usize, usize, usize, Vec<u8>)> {
+        let mut s = self.inner.lock().unwrap();
+        let (x0, y0, x1, y1) = s.bbox?;
+        s.bbox = None;
+        if s.pixels.is_empty() || x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        let row = (x1 - x0) * 4;
+        let mut out = Vec::with_capacity(row * (y1 - y0));
+        for y in y0..y1 {
+            let off = (y * s.w + x0) * 4;
+            out.extend_from_slice(&s.pixels[off..off + row]);
+        }
+        Some((x0, y0, x1, y1, out))
+    }
+
+    /// Blend one premultiplied pixel (src-over) with bounds checking.
+    fn blend_px(&mut self, x: usize, y: usize, premul: [u8; 4]) {
+        let mut s = self.inner.lock().unwrap();
+        if x >= s.w || y >= s.h {
+            return;
+        }
+        let o = (y * s.w + x) * 4;
+        if o + 3 >= s.pixels.len() {
+            return;
+        }
+        for i in 0..3 {
+            let dst = &mut s.pixels[o + i];
+            *dst = dst.saturating_add(premul[i]);
+        }
+        s.pixels[o + 3] = s.pixels[o + 3].max(premul[3]);
+    }
+
+    /// Solid premultiplied fill (src-over) with damage marking.
+    fn fill_solid(&mut self, x: i64, y: i64, w: i64, h: i64, rgba: [u8; 4]) {
+        let (sw, sh) = (self.dims().0 as i64, self.dims().1 as i64);
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x + w).min(sw);
+        let y1 = (y + h).min(sh);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        self.mark(x0 as usize, y0 as usize, x1 as usize, y1 as usize);
+        let pm = [
+            ((rgba[2] as u16 * rgba[3] as u16) / 255) as u8,
+            ((rgba[1] as u16 * rgba[3] as u16) / 255) as u8,
+            ((rgba[0] as u16 * rgba[3] as u16) / 255) as u8,
+            rgba[3],
+        ];
+        let mut s = self.inner.lock().unwrap();
+        for yy in y0..y1 {
+            let off = (yy as usize * s.w) + x0 as usize;
+            for xx in 0..(x1 - x0) as usize {
+                let o = (off + xx) * 4;
+                s.pixels[o] = s.pixels[o].saturating_add(pm[0]);
+                s.pixels[o + 1] = s.pixels[o + 1].saturating_add(pm[1]);
+                s.pixels[o + 2] = s.pixels[o + 2].saturating_add(pm[2]);
+                s.pixels[o + 3] = s.pixels[o + 3].max(pm[3]);
+            }
+        }
+    }
+}
+
+// Script-facing methods.
+impl Pen {
+    pub fn clear(&mut self) {
+        let mut s = self.inner.lock().unwrap();
+        s.pixels.iter_mut().for_each(|b| *b = 0);
+        let (w, h) = (s.w, s.h);
+        s.bbox = Some((0, 0, w, h));
+    }
+
+    fn line(&mut self, x1: i64, y1: i64, x2: i64, y2: i64, thickness: i64, c: [u8; 4]) {
+        let sx = if x1 < x2 { 1 } else { -1 };
+        let sy = if y1 < y2 { 1 } else { -1 };
+        let dx = (x2 - x1).abs();
+        let dy = (y2 - y1).abs();
+        let mut err = dx - dy;
+        let (mut x, mut y) = (x1, y1);
+        let t = thickness.max(1);
+        let half = t / 2;
+        loop {
+            self.fill_solid(x - half, y - half, t, t, c);
+            if x == x2 && y == y2 {
+                break;
+            }
+            let e2 = err * 2;
+            if e2 > -dy {
+                err -= dy;
+                x += sx;
+            }
+            if e2 < dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
+    fn text(&mut self, x: i64, y: i64, text: &str, px: i64, c: [u8; 4]) {
+        draw_text_buffer(self, x, y, text, px, c);
+    }
+
+    fn cpu_percent(&mut self) -> i64 {
+        cpu_usage()
+    }
+
+    fn ram_percent(&mut self) -> i64 {
+        unsafe {
+            use windows::Win32::System::SystemInformation::{
+                GlobalMemoryStatusEx, MEMORYSTATUSEX,
+            };
+            let mut ms = MEMORYSTATUSEX::default();
+            ms.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut ms).is_ok() && ms.ullTotalPhys > 0 {
+                ((ms.ullTotalPhys - ms.ullAvailPhys) * 100 / ms.ullTotalPhys) as i64
+            } else {
+                0
+            }
+        }
+    }
+
+    fn time(&mut self, fmt: &str) -> String {
+        unsafe {
+            use windows::Win32::System::SystemInformation::GetLocalTime;
+            let st = GetLocalTime();
+            let mut out = String::new();
+            let chars: Vec<char> = fmt.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] == '%' && i + 1 < chars.len() {
+                    let piece = match chars[i + 1] {
+                        'H' => format!("{:02}", st.wHour),
+                        'M' => format!("{:02}", st.wMinute),
+                        'S' => format!("{:02}", st.wSecond),
+                        'Y' => format!("{}", st.wYear),
+                        'm' => format!("{:02}", st.wMonth),
+                        'd' => format!("{:02}", st.wDay),
+                        'p' => if st.wHour < 12 { "AM".into() } else { "PM".into() },
+                        other => format!("%{other}"),
+                    };
+                    out.push_str(&piece);
+                    i += 2;
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            out
+        }
+    }
+
+    /// Blocking HTTP GET with 60-second caching per URL.
+    fn http_get_impl(&self, url: &str) -> String {
+        http_get_cached(url)
+    }
+
+    /// Download binary content from a URL to a local file.
+    fn http_download_impl(&self, url: &str, save_path: &str) -> bool {
+        let resolved = resolve_widget_path(save_path);
+        if let Some(parent) = resolved.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match http_download_to(url, &resolved) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::logger::log(&format!("http_download {url}: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Run a shell command and return trimmed stdout.
+    fn exec_impl(&self, cmd: &str) -> String {
+        exec_command(cmd)
+    }
+
+    /// Load an image from disk (or wallpaper-relative path), resize to
+    /// `(w x h)` and alpha-blend onto the canvas at `(x, y)`.
+    fn draw_image_impl(&mut self, x: i64, y: i64, w: i64, h: i64, path: &str) {
+        let resolved = resolve_widget_path(path);
+        if let Some((sw, sh, rgba_data)) = load_image_cached(&resolved) {
+            let resized = resize_rgba(&rgba_data, sw as usize, sh as usize, w as usize, h as usize);
+            blend_rgba_at(self, x, y, w as usize, h as usize, &resized);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host
+// ---------------------------------------------------------------------------
+
+struct ScriptItem {
+    name: String,
+    engine: Engine,
+    ast: rhai::AST,
+}
+
+/// Runs widget scripts into a shared desktop-sized canvas and tracks damage.
+pub struct WidgetHost {
+    canvas: Pen,
+    items: Vec<ScriptItem>,
+    last_run: Instant,
+    /// Damage rectangle accumulated since the last composite.
+    pending: Option<(usize, usize, usize, usize)>,
+    /// Extracted pixel data for the pending region (consumed on composite).
+    frame_data: Option<(usize, usize, usize, usize, Vec<u8>)>,
+    /// Hash of the last composited region content.
+    last_hash: u64,
+    /// Set when visible output differs from what is currently on screen.
+    changed: bool,
+}
+
+impl WidgetHost {
+    /// `Some((w, h))` when the canvas is allocated.
+    pub fn canvas_dims(&self) -> Option<(usize, usize)> {
+        let (w, h) = self.canvas.dims();
+        if w == 0 || h == 0 {
+            None
+        } else {
+            Some((w, h))
+        }
+    }
+
+    /// True when visible output differs from what is currently displayed.
+    pub fn has_changes(&self) -> bool {
+        self.changed
+    }
+
+    /// Run every script once (throttled to [`WIDGET_FPS`]). Marks `changed`
+    /// only when the produced pixels differ from the previously shown frame.
+    pub fn render_tick(&mut self) {
+        if self.items.is_empty()
+            || self.last_run.elapsed() < Duration::from_millis(1000 / WIDGET_FPS)
+        {
+            return;
+        }
+        self.last_run = Instant::now();
+        let mut scope = Scope::new();
+        for item in &self.items {
+            let pen = self.canvas.clone();
+            if let Err(e) =
+                item.engine.call_fn::<()>(&mut scope, &item.ast, "draw", (pen.clone(),))
+            {
+                crate::logger::log(&format!("widget {}: script error: {e}", item.name));
+            }
+            drop(pen);
+
+            // Track damage; identical redraws do not trigger invalidation.
+            if let Some((x0, y0, x1, y1, bytes)) = self.canvas.take_frame() {
+                let hash = fnv_hash(&bytes);
+                if self.last_hash != hash || self.pending.is_none() {
+                    self.changed = true;
+                    self.last_hash = hash;
+                    self.frame_data =
+                        Some((x0, y0, x1, y1, bytes));
+                    self.pending = Some(match self.pending {
+                        Some((a0, a1, a2, a3)) => (
+                            a0.min(x0),
+                            a1.min(y0),
+                            a2.max(x1),
+                            a3.max(y1),
+                        ),
+                        None => (x0, y0, x1, y1),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Alpha-composite the widget canvas' damaged region onto `dst` (the
+    /// wallpaper frame, BGRA, same dimensions). Uses the cached frame data
+    /// from render_tick — does not re-read the canvas.
+    pub fn composite_pending(&mut self, dst: &mut [u8]) {
+        let Some((x0, y0, x1, y1)) = self.pending else {
+            return;
+        };
+        let Some(frame) = &self.frame_data else {
+            return;
+        };
+        let bytes = &frame.4;
+        let _row = (x1 - x0) * 4;
+        let cw = self.canvas.dims().0;
+        let mut i = 0usize;
+        for ri in 0..(y1 - y0) {
+            for ci in 0..(x1 - x0) {
+                let s0 = i;
+                i += 4;
+                let dx = x0 + ci;
+                let dy = y0 + ri;
+                if dx >= cw {
+                    continue;
+                }
+                let d = (dy * cw + dx) * 4;
+                if d + 4 > dst.len() {
+                    continue;
+                }
+                let a = bytes[s0 + 3] as u32;
+                if a == 255 {
+                    dst[d] = bytes[s0];
+                    dst[d + 1] = bytes[s0 + 1];
+                    dst[d + 2] = bytes[s0 + 2];
+                } else {
+                    let inv = 255 - a;
+                    dst[d] = (bytes[s0] as u32 + dst[d] as u32 * inv / 255).min(255) as u8;
+                    dst[d + 1] =
+                        (bytes[s0 + 1] as u32 + dst[d + 1] as u32 * inv / 255).min(255) as u8;
+                    dst[d + 2] =
+                        (bytes[s0 + 2] as u32 + dst[d + 2] as u32 * inv / 255).min(255) as u8;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rebuild
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Rebuild
+// ---------------------------------------------------------------------------
+
+impl WidgetHost {
+    /// Compile every `.rhai` script in the widgets directory.
+    pub fn rebuild(size: (u32, u32), wallpaper_dir: &std::path::Path) -> WidgetHost {
+        let dir = widgets_dir(wallpaper_dir);
+        ensure_sample(&dir);
+
+        let mut host = WidgetHost {
+            canvas: Pen::new(),
+            items: Vec::new(),
+            last_run: Instant::now() - Duration::from_secs(1),
+            pending: None,
+            frame_data: None,
+            last_hash: 0,
+            changed: false,
+        };
+        host.canvas.set_region(size.0.max(1) as usize, size.1.max(1) as usize);
+
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return host;
+        };
+        let mut scripts: Vec<_> = entries
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rhai"))
+            .map(|e| e.path())
+            .collect();
+        scripts.sort();
+
+        for path in scripts {
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("widget")
+                .to_string();
+            let res = (|| -> Result<(Engine, rhai::AST), String> {
+                let src =
+                    std::fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
+                let engine = make_engine();
+                let ast = engine.compile(src).map_err(|e| format!("compile: {e}"))?;
+                Ok((engine, ast))
+            })();
+            match res {
+                Ok((engine, ast)) => host.items.push(ScriptItem { name, engine, ast }),
+                Err(e) => crate::logger::log(&format!("widget {name}: {e}")),
+            }
+        }
+        host
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Engine construction
+// ---------------------------------------------------------------------------
+
+fn make_engine() -> Engine {
+    let mut engine = Engine::new();
+    engine.register_type_with_name::<Pen>("Pen");
+
+    engine.register_fn("clear", |p: &mut Pen| p.clear());
+    engine.register_fn("width", |p: &mut Pen| p.dims().0 as i64);
+    engine.register_fn("height", |p: &mut Pen| p.dims().1 as i64);
+
+    engine.register_fn(
+        "fill_rect",
+        |p: &mut Pen, x: i64, y: i64, w: i64, h: i64, color: &str| {
+            p.fill_solid(x, y, w, h, parse_color(color));
+        },
+    );
+
+    engine.register_fn(
+        "line",
+        |p: &mut Pen, x1: i64, y1: i64, x2: i64, y2: i64, t: i64, color: &str| {
+            p.line(x1, y1, x2, y2, t, parse_color(color));
+        },
+    );
+
+    engine.register_fn(
+        "text",
+        |p: &mut Pen, x: i64, y: i64, text: &str, px: i64, color: &str| {
+            p.text(x, y, text, px, parse_color(color));
+        },
+    );
+
+    engine.register_fn("cpu", |p: &mut Pen| p.cpu_percent());
+    engine.register_fn("ram", |p: &mut Pen| p.ram_percent());
+    engine.register_fn("time", |p: &mut Pen, fmt: &str| p.time(fmt));
+
+    // HTTP / Process / Image
+    engine.register_fn("http_get", |p: &mut Pen, url: &str| p.http_get_impl(url));
+    engine.register_fn(
+        "http_download",
+        |p: &mut Pen, url: &str, path: &str| p.http_download_impl(url, path),
+    );
+    engine.register_fn("run", |p: &mut Pen, cmd: &str| p.exec_impl(cmd));
+    engine.register_fn(
+        "image",
+        |p: &mut Pen, x: i64, y: i64, w: i64, h: i64, path: &str| {
+            p.draw_image_impl(x, y, w, h, path);
+        },
+    );
+    engine
+}
+
+// ---------------------------------------------------------------------------
+// Text rendering (GDI scratch bitmap -> coverage mask -> tinted blend)
+// ---------------------------------------------------------------------------
+
+fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8; 4]) {
+    let (w, h) = pen.dims();
+    if w == 0 || h == 0 || text.is_empty() {
+        return;
+    }
+    let px = px_i.clamp(6, 400) as i32;
+
+    unsafe {
+        use windows::core::w;
+        use windows::Win32::Foundation::COLORREF;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GetDC,
+            ReleaseDC, SelectObject, SetBkMode, SetTextColor, TextOutW, BITMAPINFO,
+            BITMAPINFOHEADER, DIB_RGB_COLORS, TRANSPARENT,
+        };
+
+        let screen_dc = GetDC(None);
+        let mem = CreateCompatibleDC(screen_dc);
+        let _ = ReleaseDC(None, screen_dc);
+
+        let est_w = (px as f64 * 0.62 * text.chars().count() as f64).ceil() as i32 + 8;
+        let est_h = (px as f64 * 1.5).ceil() as i32 + 8;
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = est_w;
+        bmi.bmiHeader.biHeight = -est_h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = 0;
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bmp = match CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(b) => b,
+            Err(_) => {
+                let _ = DeleteDC(mem);
+                return;
+            }
+        };
+        let old_bmp = SelectObject(mem, bmp);
+        let hf = CreateFontW(-px, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 2, 0, w!("Segoe UI"));
+        let old_font = SelectObject(mem, hf);
+        let _ = SetBkMode(mem, TRANSPARENT);
+        let _ = SetTextColor(mem, COLORREF(0x00FF_FFFF)); // white glyphs
+
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let _ = TextOutW(mem, 0, 0, &wide);
+
+        let stride = est_w as usize * 4;
+        let data = std::slice::from_raw_parts(bits.cast::<u8>(), stride * est_h as usize);
+        for gy in 0..est_h as usize {
+            let dy = y as usize + gy;
+            if dy >= h {
+                break;
+            }
+            for gx in 0..est_w as usize {
+                let dx = x as usize + gx;
+                if dx >= w {
+                    break;
+                }
+                let so = gy * stride + gx * 4;
+                let cov = data[so].max(data[so + 1]).max(data[so + 2]);
+                if cov == 0 {
+                    continue;
+                }
+                let a = ((cov as u32) * (c[3] as u32)) / 255;
+                pen.blend_px(
+                    dx,
+                    dy,
+                    [
+                        ((c[2] as u32 * a) / 255) as u8,
+                        ((c[1] as u32 * a) / 255) as u8,
+                        ((c[0] as u32 * a) / 255) as u8,
+                        a as u8,
+                    ],
+                );
+            }
+        }
+
+        SelectObject(mem, old_font);
+        let _ = DeleteObject(hf);
+        SelectObject(mem, old_bmp);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP / Process / Image infrastructure
+// ---------------------------------------------------------------------------
+
+/// Default HTTP response cache TTL.
+const HTTP_TTL: Duration = Duration::from_secs(60);
+
+type HttpCache = HashMap<String, (Instant, String)>;
+type ImageCache = HashMap<String, (u32, u32, Arc<Vec<u8>>)>;
+
+fn http_cache() -> &'static Mutex<HttpCache> {
+    static CACHE: OnceLock<Mutex<HttpCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn image_cache() -> &'static Mutex<ImageCache> {
+    static CACHE: OnceLock<Mutex<ImageCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resolve_widget_path(path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        crate::storage::wallpaper_dir().join(p)
+    }
+}
+
+/// Nearest-neighbour resize of raw RGBA pixels.
+pub(crate) fn resize_rgba(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    tw: usize,
+    th: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; tw * th * 4];
+    for row in 0..th {
+        let sy = row * sh / th;
+        for col in 0..tw {
+            let sx = col * sw / tw;
+            let so = (sy * sw + sx) * 4;
+            let do_ = (row * tw + col) * 4;
+            if so + 4 <= src.len() && do_ + 4 <= out.len() {
+                out[do_..do_ + 4].copy_from_slice(&src[so..so + 4]);
+            }
+        }
+    }
+    out
+}
+
+/// HTTP GET with automatic 60-second caching per URL.
+pub(crate) fn http_get_cached(url: &str) -> String {
+    // Check cache first
+    {
+        let cache = http_cache().lock().unwrap();
+        if let Some((fetched, body)) = cache.get(url) {
+            if fetched.elapsed() < HTTP_TTL {
+                return body.clone();
+            }
+        }
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build();
+
+    match agent.get(url).call() {
+        Ok(resp) => {
+            let body = resp.into_string().unwrap_or_default();
+            http_cache()
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), (Instant::now(), body.clone()));
+            body
+        }
+        Err(e) => {
+            crate::logger::log(&format!("http_get {url}: {e}"));
+            String::new()
+        }
+    }
+}
+
+/// Download binary content to a local file (for images etc).
+fn http_download_to(url: &str, save_path: &Path) -> Result<(), String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .build();
+    let resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("download {url}: {e}"))?;
+    let mut reader = resp.into_reader();
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut buf)
+        .map_err(|e| format!("read body failed: {e}"))?;
+    std::fs::write(save_path, &buf).map_err(|e| format!("write failed: {e}"))
+}
+
+/// Run a shell command and return trimmed stdout.
+fn exec_command(cmd: &str) -> String {
+    std::process::Command::new("cmd")
+        .args(["/C", cmd])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Load + resize an image from disk (cached by resolved path).
+fn load_image_cached(resolved: &Path) -> Option<(u32, u32, Arc<Vec<u8>>)> {
+    {
+        let cache = image_cache().lock().ok()?;
+        if let Some((w, h, data)) = cache.get(&resolved.to_string_lossy().to_string()) {
+            return Some((*w, *h, data.clone()));
+        }
+    }
+    let img = image::open(resolved).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    let data = Arc::new(rgba.into_raw());
+    image_cache()
+        .lock()
+        .unwrap()
+        .insert(resolved.to_string_lossy().to_string(), (w, h, data.clone()));
+    Some((w, h, data))
+}
+
+/// Blend an RGBA pixel buffer onto the canvas at `(x, y)` with dimensions `(w, h)`.
+fn blend_rgba_at(pen: &Pen, x: i64, y: i64, w: usize, h: usize, rgba: &[u8]) {
+    let mut s = pen.inner.lock().unwrap();
+    for row in 0..h {
+        let dy = y as usize + row;
+        if dy >= s.h {
+            break;
+        }
+        for col in 0..w {
+            let dx = x as usize + col;
+            if dx >= s.w {
+                break;
+            }
+            let so = (row * w + col) * 4;
+            if so + 4 > rgba.len() {
+                break;
+            }
+            let a = rgba[so + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let a_premul = a as f64 / 255.0;
+            let d = (dy * s.w + dx) * 4;
+            // Premultiply source channels and blend onto existing premultiplied dst
+            s.pixels[d] = ((rgba[so + 2] as f64 * a_premul) as u8).saturating_add(s.pixels[d]);
+            s.pixels[d + 1] = ((rgba[so + 1] as f64 * a_premul) as u8).saturating_add(s.pixels[d + 1]);
+            s.pixels[d + 2] = ((rgba[so] as f64 * a_premul) as u8).saturating_add(s.pixels[d + 2]);
+            // Alpha compositing: out_a = src_a + dst_a * (1 - src_a)
+            let inv = 255 - a as u8;
+            s.pixels[d + 3] = a as u8 + ((s.pixels[d + 3] as u16 * inv as u16) / 255) as u8;
+        }
+    }
+}
+
+fn parse_color(hex: &str) -> [u8; 4] {
+    let s = hex.trim().trim_start_matches('#');
+    let val = |r: &str| u8::from_str_radix(r, 16).unwrap_or(255);
+    match s.len() {
+        8 => [
+            val(&s[0..2]),
+            val(&s[2..4]),
+            val(&s[4..6]),
+            val(&s[6..8]),
+        ],
+        6 => [val(&s[0..2]), val(&s[2..4]), val(&s[4..6]), 255],
+        3 => {
+            let v = |c: &str| u8::from_str_radix(&format!("{c}{c}"), 16).unwrap_or(255);
+            [v(&s[0..1]), v(&s[1..2]), v(&s[2..3]), 255]
+        }
+        _ => [255, 255, 255, 255],
+    }
+}
+
+static CPU_LAST: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
+
+fn cpu_usage() -> i64 {
+    unsafe {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::GetSystemTimes;
+        let mut idle = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).is_err() {
+            return 0;
+        }
+        let ft = |t: &FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+        let cur = (ft(&idle), ft(&kernel), ft(&user));
+        let mut prev = CPU_LAST.lock().unwrap();
+        let usage = match *prev {
+            Some((pi, pk, pu)) => {
+                let total = (cur.1.wrapping_sub(pk)).wrapping_add(cur.2.wrapping_sub(pu));
+                let busy = total.saturating_sub(cur.0.wrapping_sub(pi));
+                if total == 0 {
+                    0
+                } else {
+                    (busy * 100 / total).min(100)
+                }
+            }
+            None => 0,
+        };
+        *prev = Some(cur);
+        usage as i64
+    }
+}
+
+fn fnv_hash(bytes: &[u8]) -> u64 {
+    // Sampled FNV-1a: striding keeps large canvases cheap while still
+    // catching any real content change with near-certainty.
+    const STRIDE: usize = 97;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += STRIDE;
+    }
+    hash ^ (bytes.len() as u64)
+}

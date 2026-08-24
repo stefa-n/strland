@@ -778,13 +778,21 @@ static WALLPAPER_OPEN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 #[cfg(target_os = "windows")]
 static WIN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "windows")]
+static WIN_COMBO_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "windows")]
 static ALT_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static SHIFT_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static SWITCHER_TAB_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(target_os = "windows")]
 static ALT_RELEASED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(target_os = "windows")]
 static ESC_PRESSED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static SCREENSHOT_TRIGGER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static SCREENSHOT_DONE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Millis since boot (matches GetTickCount64 stamps from the hook thread).
 #[cfg(target_os = "windows")]
@@ -943,6 +951,155 @@ pub fn take_media_key_event(max_age_ms: u64) -> Option<u32> {
     Some(kind)
 }
 
+/// Win+Shift+S screenshot trigger — set from the hook, consumed by the UI thread.
+#[cfg(target_os = "windows")]
+pub fn take_screenshot_trigger(max_age_ms: u64) -> bool {
+    let stamp = SCREENSHOT_TRIGGER_MS.load(Ordering::Relaxed);
+    if stamp == 0 {
+        return false;
+    }
+    if tick_ms().saturating_sub(stamp) > max_age_ms {
+        SCREENSHOT_TRIGGER_MS.store(0, Ordering::Relaxed);
+        return false;
+    }
+    SCREENSHOT_TRIGGER_MS.store(0, Ordering::Relaxed);
+    true
+}
+
+/// Signals that a background-thread screenshot capture completed.
+#[cfg(target_os = "windows")]
+pub fn notify_screenshot_done() {
+    SCREENSHOT_DONE_MS.store(tick_ms(), Ordering::Relaxed);
+}
+
+/// Consumes the "screenshot done" signal once.
+#[cfg(target_os = "windows")]
+pub fn take_screenshot_done(max_age_ms: u64) -> bool {
+    let stamp = SCREENSHOT_DONE_MS.load(Ordering::Relaxed);
+    if stamp == 0 {
+        return false;
+    }
+    if tick_ms().saturating_sub(stamp) > max_age_ms {
+        SCREENSHOT_DONE_MS.store(0, Ordering::Relaxed);
+        return false;
+    }
+    SCREENSHOT_DONE_MS.store(0, Ordering::Relaxed);
+    true
+}
+
+/// Captures the entire primary screen and copies it to the clipboard as CF_DIB.
+/// Runs on a background thread — never call from the hook.
+#[cfg(target_os = "windows")]
+pub fn capture_screen_to_clipboard() -> bool {
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        CAPTUREBLT, DIB_RGB_COLORS, SRCCOPY,
+    };
+
+    unsafe extern "system" {
+        fn OpenClipboard(hWndNewOwner: isize) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(uFormat: u32, hMem: isize) -> isize;
+        fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> isize;
+        fn GlobalLock(hMem: isize) -> *mut u8;
+        fn GlobalUnlock(hMem: isize) -> i32;
+    }
+
+    const CF_DIB: u32 = 8;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+
+    unsafe {
+        let w = GetSystemMetrics(SM_CXSCREEN);
+        let h = GetSystemMetrics(SM_CYSCREEN);
+        if w <= 0 || h <= 0 {
+            return false;
+        }
+        let hdc_screen = GetDC(None);
+        if hdc_screen.is_invalid() {
+            return false;
+        }
+        let hdc_mem = CreateCompatibleDC(hdc_screen);
+        let hbm = CreateCompatibleBitmap(hdc_screen, w, h);
+        let old = SelectObject(hdc_mem, hbm);
+
+        // SRCCOPY | CAPTUREBLT captures the screen including layered windows.
+        let _ = BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, 0, 0, SRCCOPY | CAPTUREBLT);
+
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = h; // bottom-up (positive)
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0;
+
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        let lines = GetDIBits(
+            hdc_mem,
+            hbm,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr().cast()),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+
+        SelectObject(hdc_mem, old);
+        let _ = DeleteDC(hdc_mem);
+        let _ = DeleteObject(hbm);
+        ReleaseDC(None, hdc_screen);
+
+        if lines == 0 {
+            return false;
+        }
+
+        // BITMAPINFOHEADER (40 bytes) + pixel data.
+        let header_size = std::mem::size_of::<BITMAPINFOHEADER>();
+        let total = header_size + buf.len();
+        let hmem = GlobalAlloc(GMEM_MOVEABLE, total);
+        if hmem == 0 {
+            return false;
+        }
+        let ptr = GlobalLock(hmem);
+        if ptr.is_null() {
+            return false;
+        }
+
+        // Write BITMAPINFOHEADER.
+        let hdr = BITMAPINFOHEADER {
+            biSize: header_size as u32,
+            biWidth: w,
+            biHeight: h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        std::ptr::copy_nonoverlapping(
+            &hdr as *const _ as *const u8,
+            ptr,
+            header_size,
+        );
+        // Write BGRA pixel data.
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr.add(header_size), buf.len());
+
+        let _ = GlobalUnlock(hmem);
+
+        if OpenClipboard(0) != 0 {
+            let _ = EmptyClipboard();
+            let _ = SetClipboardData(CF_DIB, hmem);
+            let _ = CloseClipboard();
+            debug_log("[screenshot] screen captured to clipboard");
+            true
+        } else {
+            debug_log("[screenshot] OpenClipboard failed");
+            false
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn shell_is_running() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
@@ -978,7 +1135,10 @@ pub fn start_media_key_hook() {
     const VK_LWIN: u32 = 0x5B;
     const VK_RWIN: u32 = 0x5C;
     const VK_A: u32 = 0x41;
+    const VK_S: u32 = 0x53;
     const VK_W: u32 = 0x57;
+    const VK_LSHIFT: u32 = 0xA0;
+    const VK_RSHIFT: u32 = 0xA1;
     const VK_LMENU: u32 = 0xA4;
     const VK_RMENU: u32 = 0xA5;
     const VK_MENU: u32 = 0x12;
@@ -1003,9 +1163,14 @@ pub fn start_media_key_hook() {
                     if kb.vkCode == VK_LWIN || kb.vkCode == VK_RWIN {
                         if wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN {
                             WIN_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
-                            SUPER_KEY_MS.store(tick_ms(), Ordering::Relaxed);
+                            WIN_COMBO_FIRED.store(false, std::sync::atomic::Ordering::Relaxed);
                         } else if wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP {
                             WIN_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+                            // Only fire the launcher trigger if no Win+<key>
+                            // combo was activated while Win was held — bare Win.
+                            if !WIN_COMBO_FIRED.load(std::sync::atomic::Ordering::Relaxed) {
+                                SUPER_KEY_MS.store(tick_ms(), Ordering::Relaxed);
+                            }
                         }
                         return LRESULT(1); // exclusive — no native Start menu
                     }
@@ -1020,6 +1185,15 @@ pub fn start_media_key_hook() {
                         } else if wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP {
                             ALT_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
                             ALT_RELEASED_MS.store(tick_ms(), Ordering::Relaxed);
+                        }
+                    }
+                    // Track Shift key for Win+Shift+S.
+                    let is_shift = kb.vkCode == VK_LSHIFT || kb.vkCode == VK_RSHIFT;
+                    if is_shift {
+                        if wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN {
+                            SHIFT_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+                        } else if wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP {
+                            SHIFT_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     let is_tab_key = wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN;
@@ -1049,13 +1223,23 @@ pub fn start_media_key_hook() {
                         let win_held = WIN_DOWN.load(std::sync::atomic::Ordering::Relaxed);
                         // Win+A → open the control center.
                         if kb.vkCode == VK_A && win_held {
+                            WIN_COMBO_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
                             CONTROL_OPEN_MS.store(tick_ms(), Ordering::Relaxed);
                             return LRESULT(1);
                         }
                         // Win+W → open the wallpaper panel.
                         if kb.vkCode == VK_W && win_held {
+                            WIN_COMBO_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
                             debug_log("[keys] Win+W detected");
                             WALLPAPER_OPEN_MS.store(tick_ms(), Ordering::Relaxed);
+                            return LRESULT(1);
+                        }
+                        // Win+Shift+S → fullscreen screenshot to clipboard.
+                        let shift_held = SHIFT_DOWN.load(std::sync::atomic::Ordering::Relaxed);
+                        if kb.vkCode == VK_S && win_held && shift_held {
+                            WIN_COMBO_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
+                            debug_log("[keys] Win+Shift+S detected");
+                            SCREENSHOT_TRIGGER_MS.store(tick_ms(), Ordering::Relaxed);
                             return LRESULT(1);
                         }
                         let kind = match kb.vkCode {
@@ -2606,3 +2790,11 @@ pub fn wifi_radio_is_on() -> bool { false }
 pub fn bluetooth_radio_is_on() -> bool { false }
 #[cfg(not(target_os = "windows"))]
 pub fn set_quiet_hours(_on: bool) {}
+#[cfg(not(target_os = "windows"))]
+pub fn take_screenshot_trigger(_max_age_ms: u64) -> bool { false }
+#[cfg(not(target_os = "windows"))]
+pub fn notify_screenshot_done() {}
+#[cfg(not(target_os = "windows"))]
+pub fn take_screenshot_done(_max_age_ms: u64) -> bool { false }
+#[cfg(not(target_os = "windows"))]
+pub fn capture_screen_to_clipboard() -> bool { false }

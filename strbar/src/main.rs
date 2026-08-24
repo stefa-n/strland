@@ -801,6 +801,40 @@ impl eframe::App for DynamicIslandApp {
                 self.focus_window();
             }
         }
+        // Win+Shift+S → fullscreen screenshot to clipboard (background thread).
+        if win::take_screenshot_trigger(500) {
+            win::debug_log("[screenshot] Win+Shift+S trigger fired — spawning capture");
+            self.focus_window();
+            std::thread::spawn(|| {
+                let ok = win::capture_screen_to_clipboard();
+                if ok {
+                    win::notify_screenshot_done();
+                } else {
+                    win::debug_log("[screenshot] capture failed");
+                }
+            });
+        }
+        // Screenshot done → show a brief "Screenshot taken" notification card.
+        if win::take_screenshot_done(2000) {
+            win::debug_log("[screenshot] capture done — showing notification");
+            let now = Instant::now();
+            self.notif = Some(win::NotificationInfo {
+                id: u32::MAX,
+                app: "Screenshot".to_string(),
+                title: "Screenshot taken".to_string(),
+                body: String::new(),
+            });
+            self.notif_shown_at = Some(now);
+            self.notif_deadline =
+                Some(now + Duration::from_millis(self.cfg.notification_timeout_ms));
+            self.mode = IslandMode::Notification;
+            if self.hidden {
+                self.hidden = false;
+                self.target_y = self.cfg.y_padding;
+                self.y_animating = true;
+            }
+            ctx.request_repaint();
+        }
         if self.control_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.control_state.submenu != modes::ControlSubmenu::None {
                 self.control_state.submenu = modes::ControlSubmenu::None;
@@ -1120,9 +1154,14 @@ impl eframe::App for DynamicIslandApp {
                     }
                     IslandMode::Notification => {
                         let (small, big) = if let Some(n) = &self.notif {
-                            // Discord-style: "<username> on Discord" + message body.
-                            let img = format!("{} on {}", n.title, n.app);
-                            (img, n.body.clone())
+                            if n.app == "Screenshot" {
+                                // Screenshot notification: app name as small, title as big.
+                                (n.app.clone(), n.title.clone())
+                            } else {
+                                // Discord-style: "<username> on Discord" + message body.
+                                let img = format!("{} on {}", n.title, n.app);
+                                (img, n.body.clone())
+                            }
                         } else {
                             let m = win::media_text().map(|m| (m.title, m.artist)).unwrap_or_default();
                             ("Now Playing".to_string(), m.0)
@@ -1201,8 +1240,12 @@ impl eframe::App for DynamicIslandApp {
                     ),
                     IslandMode::Notification => {
                         let (small, big) = if let Some(n) = &self.notif {
-                            let img = format!("{} on {}", n.title, n.app);
-                            (img, n.body.clone())
+                            if n.app == "Screenshot" {
+                                (n.app.clone(), n.title.clone())
+                            } else {
+                                let img = format!("{} on {}", n.title, n.app);
+                                (img, n.body.clone())
+                            }
                         } else {
                             let m = win::media_text().map(|m| (m.title, m.artist)).unwrap_or_default();
                             ("Now Playing".to_string(), m.0)

@@ -95,9 +95,54 @@ pub fn frame_at(w: &mut Wallpaper, elapsed: Duration) -> Option<Arc<Raster>> {
     }
 }
 
+/// Scale a raster to exactly `(tw x th)` using a centre-crop "cover" fit.
+/// `fast` selects nearest-neighbour (GIF frames); otherwise triangle filtering
+/// is used (still images).
+pub fn fit_cover(raster: &Raster, tw: usize, th: usize, fast: bool) -> Raster {
+    use image::imageops::FilterType;
+    let filter = if fast { FilterType::Nearest } else { FilterType::Triangle };
+
+    // BGRA -> RGBA for the image crate.
+    let mut rgba = Vec::with_capacity(raster.bgra.len());
+    for px in raster.bgra.chunks_exact(4) {
+        rgba.push(px[2]);
+        rgba.push(px[1]);
+        rgba.push(px[0]);
+        rgba.push(px[3]);
+    }
+    let Some(ib) = image::RgbaImage::from_raw(raster.width as u32, raster.height as u32, rgba)
+    else {
+        return raster.clone();
+    };
+
+    // Centre-crop to the target aspect ratio, then resize.
+    let src_ar = raster.width as f64 / raster.height.max(1) as f64;
+    let dst_ar = tw as f64 / th.max(1) as f64;
+    let cropped = if src_ar > dst_ar {
+        let cw = ((raster.height as f64) * dst_ar).floor() as u32;
+        let x = raster.width.saturating_sub(cw as usize) as u32 / 2;
+        image::imageops::crop_imm(&ib, x, 0, cw, raster.height as u32)
+    } else {
+        let ch = ((raster.width as f64) / dst_ar).floor() as u32;
+        let y = raster.height.saturating_sub(ch as usize) as u32 / 2;
+        image::imageops::crop_imm(&ib, 0, y, raster.width as u32, ch)
+    };
+    let resized = image::imageops::resize(&cropped.to_image(), tw as u32, th as u32, filter);
+
+    // RGBA -> BGRA.
+    let mut bgra = resized.into_raw();
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    Raster {
+        width: tw,
+        height: th,
+        bgra,
+    }
+}
+
 /// Decode a still image file into a raster.
-pub fn decode_still(path: &Path) -> Result<Raster, String> {
-    let img = image::open(path).map_err(|e| format!("image open failed: {e}"))?;
+pub fn decode_still(path: &Path) -> Result<Raster, String> {    let img = image::open(path).map_err(|e| format!("image open failed: {e}"))?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     Ok(Raster::from_rgba(&rgba.into_raw(), w, h))

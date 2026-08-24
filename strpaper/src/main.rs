@@ -24,6 +24,7 @@ mod render;
 mod storage;
 mod video;
 mod watch;
+mod widgets;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -32,7 +33,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use desktop::Monitor;
 use logger::log;
-use render::{Wallpaper, decode_animated, decode_still, frame_at, needs_ticks};
+use render::{Wallpaper, decode_animated, decode_still, fit_cover, frame_at, needs_ticks};
 use watch::WallpaperWatcher;
 
 use windows::core::w;
@@ -77,6 +78,18 @@ const VIDEO_TIMEOUT_SECS: f64 = 5.0;
 static WALLPAPER_HWND: AtomicIsize = AtomicIsize::new(0);
 
 fn main() {
+    // Shell apps live in COM; initialize the main apartment up front so MF
+    // probes on this thread behave.
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
+    }
+
+    // Temporary bisect switches (also useful as escape hatches).
+    let no_widgets = std::env::var("STRPAPER_NO_WIDGETS").is_ok();
+
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -95,6 +108,21 @@ fn main() {
         }
     };
 
+    // Separate watcher for the widgets directory (its own dirty flag).
+    let wdir = widgets::widgets_dir(&dir);
+    widgets::ensure_sample(&wdir);
+    let widgets_watcher = if no_widgets {
+        None
+    } else {
+        match WallpaperWatcher::new(&wdir) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                log(&format!("widget watching disabled: {e}"));
+                None
+            }
+        }
+    };
+
     let mut app = App {
         dir,
         watcher,
@@ -106,7 +134,6 @@ fn main() {
         timer_ms: POLL_MS,
         monitors: Vec::new(),
         origin: (0, 0),
-        painted_once: false,
         painted_version: 0,
         video_path: None,
         render_paused: false,
@@ -116,6 +143,8 @@ fn main() {
         transcoded_cache: None,
         transcode_rx: None,
         transcode_generation: 0,
+        widget_host: None,
+        widgets_watcher,
     };
 
     run_message_loop(&mut app);
@@ -138,14 +167,17 @@ struct App {
     motion: bool,
     timer_ms: u32,
     monitors: Vec<Monitor>,
-    origin: (i32, i32),
-    painted_once: bool,
+    origin: (i32, i32),
     /// Version of the last video frame we painted (skip redundant repaints).
     painted_version: u64,
     /// Path of the currently loaded video, for GPU->software fallback.
     video_path: Option<PathBuf>,
     /// Rendering is suspended (maximized/fullscreen app covering the desktop).
     render_paused: bool,
+    /// Programmable widgets (scripts above wallpaper, below icons/apps).
+    widget_host: Option<widgets::WidgetHost>,
+    /// Watches the widgets directory.
+    widgets_watcher: Option<watch::WallpaperWatcher>,
     /// What is currently loaded, so unchanged files are never re-read.
     loaded_source: Option<(PathBuf, Option<SystemTime>)>,
     /// Last-read wallpaper name from the config file.
@@ -260,7 +292,11 @@ impl App {
 
             // Optional pre-conversion: re-encode once to the configured height
             // (in memory) so playback never has to chew through 4K frames.
-            let quality_height = storage::read_configured_quality(&self.dir);
+            let quality_height = if std::env::var("STRPAPER_NO_TRANSCODE").is_ok() {
+                None
+            } else {
+                storage::read_configured_quality(&self.dir)
+            };
             if let Some(qh) = quality_height {
                 let (src_w, src_h) =
                     video::VideoPlayer::probe_size(&data).unwrap_or((0, 0));
@@ -271,7 +307,8 @@ impl App {
                     // Already converted for this file/size? Play it directly.
                     if let Some((key, bytes)) = &self.transcoded_cache {
                         if key.0 == path && key.1 == mtime && key.2 == out_h {
-                            return self.open_video(bytes.clone(), None);
+                            let tgt = self.target_size();
+                            return self.open_video(bytes.clone(), tgt);
                         }
                     }
 
@@ -304,6 +341,9 @@ impl App {
             self.video_path = None;
             self.frame_start = Instant::now();
             self.painted_version = 0;
+            // Fit to the desktop size so widget compositing has matching
+            // dimensions (and blitting is 1:1).
+            let fit = self.target_size();
             let ext = path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -311,7 +351,15 @@ impl App {
                 .unwrap_or_default();
             self.wallpaper = if ext == "gif" {
                 decode_animated(&path)
-                    .map(Wallpaper::Animated)
+                    .map(|mut a| {
+                        if let Some((tw, th)) = fit {
+                            for f in &mut a.frames {
+                                f.raster =
+                                    Arc::new(fit_cover(&f.raster, tw as usize, th as usize, true));
+                            }
+                        }
+                        Wallpaper::Animated(a)
+                    })
                     .map_err(|e| {
                         log(&format!(
                             "failed to load {} ({e:?})",
@@ -322,7 +370,13 @@ impl App {
                     .ok()
             } else {
                 decode_still(&path)
-                    .map(|r| Wallpaper::Still(Arc::new(r)))
+                    .map(|r| {
+                        let r = match fit {
+                            Some((tw, th)) => fit_cover(&r, tw as usize, th as usize, false),
+                            None => r,
+                        };
+                        Wallpaper::Still(Arc::new(r))
+                    })
                     .map_err(|e| {
                         log(&format!("failed to load {} ({e:?})", path.display()));
                         e
@@ -353,7 +407,7 @@ impl App {
             .as_ref()
             .map(|w| needs_ticks(w))
             .unwrap_or(false);
-        self.timer_ms = if self.motion { MOTION_MS } else { POLL_MS };
+        self.timer_ms = if self.motion || self.widget_host.is_some() { MOTION_MS } else { POLL_MS };
         if self.wallpaper.is_some() {
             self.show_window();
         }
@@ -413,7 +467,26 @@ impl App {
             }
         }
         self.refresh_monitors();
+        self.rebuild_widgets();
         self.invalidate();
+    }
+
+    /// (Re)create the widget canvas + scripts for the current desktop size.
+    fn rebuild_widgets(&mut self) {
+        if std::env::var("STRPAPER_NO_WIDGETS").is_ok() {
+            return;
+        }
+        let size = (self.monitors.iter().map(|m| m.width).sum::<i32>().max(1) as u32,
+                    self.monitors.iter().map(|m| m.height).sum::<i32>().max(1) as u32);
+        self.widget_host =
+            Some(widgets::WidgetHost::rebuild(size, &self.dir));
+    }
+
+    fn widgets_watcher_dirty(&mut self) -> bool {
+        match &self.widgets_watcher {
+            Some(w) => w.is_dirty(),
+            None => false,
+        }
     }
 
     /// Open a video player for pre-converted bytes (GPU first, SW fallback),
@@ -473,7 +546,8 @@ impl App {
                         self.transcoded_cache =
                             Some(((p.clone(), *m, out_h), Arc::new(bytes.clone())));
                     }
-                    self.open_video(Arc::new(bytes), None);
+                    let tgt = self.target_size();
+                    self.open_video(Arc::new(bytes), tgt);
                 }
                 TranscodeResult::Failed(_, e) => {
                     log(&format!("pre-conversion failed ({e}); playing original"));
@@ -488,7 +562,7 @@ impl App {
                                 .as_ref()
                                 .map(|w| needs_ticks(w))
                                 .unwrap_or(false);
-                            self.timer_ms = if self.motion { MOTION_MS } else { POLL_MS };
+                            self.timer_ms = if self.motion || self.widget_host.is_some() { MOTION_MS } else { POLL_MS };
                             if self.wallpaper.is_some() {
                                 self.show_window();
                             }
@@ -536,7 +610,24 @@ impl App {
             }
         }
 
-        // Skip all painting work while covered.
+        // Widget script changes: rebuild the canvas + scripts.
+        if self.widgets_watcher_dirty() {
+            self.rebuild_widgets();
+            self.painted_version = 0;
+            self.invalidate();
+        }
+
+        // Run widget scripts while visible (they feed the shared canvas).
+        if !self.render_paused {
+            if let Some(host) = &mut self.widget_host {
+                host.render_tick();
+                if host.has_changes() {
+                    self.invalidate();
+                }
+            }
+        }
+
+        // Skip failure/stall checks and motion invalidation while covered.
         if self.render_paused {
             return;
         }
@@ -579,7 +670,7 @@ impl App {
                             .as_ref()
                             .map(|w| needs_ticks(w))
                             .unwrap_or(false);
-                        self.timer_ms = if self.motion { MOTION_MS } else { POLL_MS };
+                        self.timer_ms = if self.motion || self.widget_host.is_some() { MOTION_MS } else { POLL_MS };
                         if self.wallpaper.is_some() {
                             self.show_window();
                             self.invalidate();
@@ -628,8 +719,31 @@ impl App {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
             if let Some(raster) = frame_at(wallpaper, self.frame_start.elapsed()) {
-                render::paint_frame(hdc, &self.monitors, self.origin, raster.as_ref());
-                self.painted_once = true;
+                // Composite widgets over the wallpaper frame when the widget
+                // canvas matches the raster dimensions (both are desktop-sized
+                // for videos and pre-fitted stills).
+                let mut composited: Option<render::Raster> = None;
+                if let Some(host) = &mut self.widget_host {
+                    if let Some((cw, ch)) = host.canvas_dims() {
+                        if raster.width == cw && raster.height == ch {
+                            let mut frame = raster.bgra.clone();
+                            host.composite_pending(frame.as_mut_slice());
+                            composited = Some(render::Raster {
+                                width: cw,
+                                height: ch,
+                                bgra: frame,
+                            });
+                        }
+                    }
+                }
+                match &composited {
+                    Some(frame) => {
+                        render::paint_frame(hdc, &self.monitors, self.origin, frame);
+                    }
+                    None => {
+                        render::paint_frame(hdc, &self.monitors, self.origin, raster.as_ref());
+                    }
+                }
             } else {
                 render::paint_clear(hdc, &self.monitors, self.origin);
             }
@@ -706,6 +820,10 @@ fn run_message_loop(app: &mut App) {
 
         app.refresh_monitors(); // show behind the icons now that we know the host
         app.reload();
+        app.rebuild_widgets();
+
+        // Widget canvas + scripts are built by rebuild_widgets() (called from
+        // refresh paths); nothing window-based to do here.
 
         // Make Ctrl+C / Ctrl+Break / console close graceful.
         let _ = SetConsoleCtrlHandler(Some(console_ctrl_handler), true);
