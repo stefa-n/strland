@@ -1095,7 +1095,7 @@ impl eframe::App for DynamicIslandApp {
             egui::Id::new("island_pill"),
         ));
         let accent = Config::parse_color(&self.cfg.accent_color);
-        let background = Config::parse_color(&self.cfg.background);
+        let background = Config::parse_color(&self.cfg.status_button_background);
         let font_id = egui::FontId::new(self.cfg.font_size, egui::FontFamily::Proportional);
 
         if !morphing {

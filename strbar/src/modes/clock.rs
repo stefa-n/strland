@@ -170,9 +170,9 @@ pub fn draw_clock_island(
                 title_text.to_owned(),
                 title_font.clone(),
                 egui::Color32::from_rgba_premultiplied(
-                    255,
-                    255,
-                    255,
+                    accent.r(),
+                    accent.g(),
+                    accent.b(),
                     (content_alpha * 255.0).round() as u8,
                 ),
             );

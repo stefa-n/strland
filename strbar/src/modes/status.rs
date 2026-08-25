@@ -60,6 +60,7 @@ pub fn draw_status_icons(
     let btn_center = egui::pos2(right - btn_size.x / 2.0, cy);
     let btn_rect = egui::Rect::from_center_size(btn_center, btn_size);
 
+    // Show background only when pill is expanded (hover).
     if hover {
         let button_bg = Config::parse_color(&cfg.status_button_background);
         let button_alpha = (button_bg.a() as f32 * alpha).round() as u8;

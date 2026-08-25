@@ -36,7 +36,7 @@ pub fn draw_notification_mode(
     let inner = pill_rect.shrink2(egui::vec2(22.0, 0.0));
     let max_w = inner.width();
     let truncated = truncate_to_width(painter, big, &font, max_w);
-    let galley = painter.layout_no_wrap(truncated, font, egui::Color32::from_rgba_premultiplied(255, 255, 255, title_alpha));
+    let galley = painter.layout_no_wrap(truncated, font, egui::Color32::from_rgba_premultiplied(accent.r(), accent.g(), accent.b(), title_alpha));
     let clipped = painter.with_clip_rect(inner);
     clipped.galley(
         egui::pos2(center.x - galley.size().x * 0.5, center.y + 8.0 - galley.size().y * 0.5),

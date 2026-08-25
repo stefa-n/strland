@@ -70,6 +70,8 @@ fn tile(
     accent: egui::Color32,
     alpha: f32,
     on: bool,
+    item_bg: egui::Color32,
+    bg_color: egui::Color32,
 ) -> TileZone {
     let response = ui.interact(rect, ui.make_persistent_id(("cctile", label)), egui::Sense::click());
     let hovered = response.hovered() || on;
@@ -77,17 +79,19 @@ fn tile(
     let (bg, fg) = if on {
         (
             egui::Color32::from_rgba_premultiplied(accent.r(), accent.g(), accent.b(), 255),
-            egui::Color32::from_rgb(18, 18, 18),
+            bg_color,
         )
     } else {
         let lift = if hovered { 14.0 } else { 0.0 };
+        let base = item_bg;
         (
-            egui::Color32::from_rgb(
-                (24.0 + lift) as u8,
-                (24.0 + lift) as u8,
-                (26.0 + lift) as u8,
+            egui::Color32::from_rgba_premultiplied(
+                (base.r() as f32 + lift).min(255.0) as u8,
+                (base.g() as f32 + lift).min(255.0) as u8,
+                (base.b() as f32 + lift).min(255.0) as u8,
+                base.a(),
             ),
-            egui::Color32::from_rgb(220, 220, 220),
+            accent,
         )
     };
 
@@ -114,11 +118,15 @@ fn tile(
         egui::FontId::new(13.0, egui::FontFamily::Proportional),
         egui::Color32::from_rgba_premultiplied(fg.r(), fg.g(), fg.b(), (alpha * 255.0) as u8),
     );
+    // Truncated sublabel to prevent overflow.
+    let sub_font = egui::FontId::new(11.0, egui::FontFamily::Proportional);
+    let max_w = rect.width() - 58.0;
+    let truncated_sub = truncate_to_fit(ui.painter(), sublabel, &sub_font, max_w);
     ui.painter().text(
         egui::pos2(rect.left() + 50.0, rect.center().y + 9.0),
         egui::Align2::LEFT_CENTER,
-        sublabel,
-        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+        &truncated_sub,
+        sub_font,
         egui::Color32::from_rgba_premultiplied(fg.r(), fg.g(), fg.b(), (alpha * 255.0 * 0.7) as u8),
     );
 
@@ -146,9 +154,10 @@ fn slider_row(
     value: f32,
     id: &'static str,
     on_change: impl FnOnce(f32),
+    item_bg: egui::Color32,
 ) {
     let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height));
-    ui.painter().rect_filled(rect, egui::CornerRadius::same((height / 2.0) as u8), egui::Color32::from_rgb(34, 34, 36));
+    ui.painter().rect_filled(rect, egui::CornerRadius::same((height / 2.0) as u8), item_bg);
 
     let icon_size = 20.0;
     let icon_x = x + 16.0;
@@ -161,7 +170,7 @@ fn slider_row(
             icon.id(),
             icon_rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::from_rgb(235, 235, 235),
+            accent,
         );
     }
 
@@ -195,9 +204,9 @@ fn submenu(
     accent: egui::Color32,
     title: &str,
     rows: Vec<(String, bool)>, // (label, is_current)
+    item_bg: egui::Color32,
 ) -> Option<usize> {
-    let bg = egui::Color32::from_rgb(28, 28, 30);
-    ui.painter().rect_filled(rect, egui::CornerRadius::same(22), bg);
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(22), item_bg);
 
     let pad = 14.0;
     ui.painter().text(
@@ -205,7 +214,7 @@ fn submenu(
         egui::Align2::LEFT_TOP,
         title,
         egui::FontId::new(14.0, egui::FontFamily::Proportional),
-        egui::Color32::from_rgb(230, 230, 230),
+        accent,
     );
 
     let mut hit: Option<usize> = None;
@@ -232,7 +241,7 @@ fn submenu(
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::new(13.0, egui::FontFamily::Proportional),
-            egui::Color32::from_rgb(230, 230, 230),
+            accent,
         );
         if resp.clicked() {
             hit = Some(i);
@@ -259,6 +268,9 @@ pub fn draw_control_center(
     let bg = Config::parse_color(&cfg.background);
     let bg = egui::Color32::from_rgb(bg.r(), bg.g(), bg.b());
     ui.painter().rect_filled(rect, egui::CornerRadius::same(30), bg);
+
+    let item_bg = Config::parse_color(&cfg.status_button_background);
+    let item_bg = egui::Color32::from_rgb(item_bg.r(), item_bg.g(), item_bg.b());
 
     let pad = 16.0;
     let gap = 10.0;
@@ -288,7 +300,7 @@ pub fn draw_control_center(
         "Off".to_string()
     };
 
-    let zone = tile(ui, row1[0], "Wi-Fi", &wifi_sub, Some(&icons.wifi), accent, 1.0, wifi_on);
+    let zone = tile(ui, row1[0], "Wi-Fi", &wifi_sub, Some(&icons.wifi), accent, 1.0, wifi_on, item_bg, bg);
     match zone {
         TileZone::Icon => actions.push(ControlAction::ToggleWifi),
         TileZone::Text => actions.push(ControlAction::OpenSubmenu(ControlSubmenu::Wifi)),
@@ -299,7 +311,7 @@ pub fn draw_control_center(
     let audio_sub = if audio_name.is_empty() { "System output".to_string() } else { audio_name };
     let muted = win::get_mute();
     let audio_icon = if muted { &icons.audio_muted } else { &icons.audio };
-    let zone = tile(ui, row1[1], "Audio", &audio_sub, Some(audio_icon), accent, 1.0, !muted);
+    let zone = tile(ui, row1[1], "Audio", &audio_sub, Some(audio_icon), accent, 1.0, !muted, item_bg, bg);
     match zone {
         TileZone::Icon => actions.push(ControlAction::ToggleMute),
         TileZone::Text => actions.push(ControlAction::OpenSubmenu(ControlSubmenu::Audio)),
@@ -315,14 +327,14 @@ pub fn draw_control_center(
     } else {
         "Off".to_string()
     };
-    let zone = tile(ui, row2[0], "Bluetooth", &bt_sub, Some(&icons.bt), accent, 1.0, bt_on);
+    let zone = tile(ui, row2[0], "Bluetooth", &bt_sub, Some(&icons.bt), accent, 1.0, bt_on, item_bg, bg);
     match zone {
         TileZone::Icon => actions.push(ControlAction::ToggleBluetooth),
         TileZone::Text => actions.push(ControlAction::OpenSubmenu(ControlSubmenu::Bluetooth)),
         TileZone::None => {}
     }
 
-    let zone = tile(ui, row2[1], "Peace", if state.dnd { "On" } else { "Off" }, Some(&icons.moon), accent, 1.0, state.dnd);
+    let zone = tile(ui, row2[1], "Peace", if state.dnd { "On" } else { "Off" }, Some(&icons.moon), accent, 1.0, state.dnd, item_bg, bg);
     match zone {
         TileZone::Icon | TileZone::Text => actions.push(ControlAction::ToggleDnd),
         TileZone::None => {}
@@ -339,6 +351,8 @@ pub fn draw_control_center(
         accent,
         1.0,
         state.night_light,
+        item_bg,
+        bg,
     );
     match zone {
         TileZone::Icon | TileZone::Text => actions.push(ControlAction::ToggleNightLight),
@@ -355,6 +369,8 @@ pub fn draw_control_center(
         accent,
         1.0,
         false,
+        item_bg,
+        bg,
     );
     if zone != TileZone::None {
         actions.push(ControlAction::OpenSubmenu(ControlSubmenu::Power));
@@ -372,11 +388,11 @@ pub fn draw_control_center(
         egui::pos2(rect.left() + pad + pill_w + gap, y_pills),
         egui::vec2(pill_w, pill_h),
     );
-    let wp_zone = tile(ui, wp_rect, "Wallpapers", "Pick wallpaper", None, accent, 1.0, false);
+    let wp_zone = tile(ui, wp_rect, "Wallpapers", "Pick wallpaper", None, accent, 1.0, false, item_bg, bg);
     if wp_zone != TileZone::None {
         actions.push(ControlAction::OpenWallpapers);
     }
-    let th_zone = tile(ui, th_rect, "Themes", "Switch theme", None, accent, 1.0, false);
+    let th_zone = tile(ui, th_rect, "Themes", "Switch theme", None, accent, 1.0, false, item_bg, bg);
     if th_zone != TileZone::None {
         actions.push(ControlAction::OpenThemes);
     }
@@ -385,7 +401,7 @@ pub fn draw_control_center(
     let y3 = y_pills + pill_h + gap;
     let slider_h = 40.0;
     let mut vol = volume;
-    slider_row(ui, y3, rect.left() + pad, content_w, slider_h, Some(&icons.audio), accent, vol, "volume", |v| vol = v);
+    slider_row(ui, y3, rect.left() + pad, content_w, slider_h, Some(&icons.audio), accent, vol, "volume", |v| vol = v, item_bg);
     win::set_volume(vol);
 
     // Submenu area (appears when a tile's text is tapped).
@@ -401,7 +417,7 @@ pub fn draw_control_center(
                     .iter()
                     .map(|d| (d.name.clone(), false))
                     .collect();
-                if let Some(i) = submenu(ui, sub_rect, accent, "Audio output", devices) {
+                if let Some(i) = submenu(ui, sub_rect, accent, "Audio output", devices, item_bg) {
                     if let Some(dev) = win::list_audio_outputs().get(i) {
                         actions.push(ControlAction::SetDefaultAudio(dev.id.clone()));
                     }
@@ -412,7 +428,7 @@ pub fn draw_control_center(
                     .iter()
                     .map(|n| (n.ssid.clone(), false))
                     .collect();
-                if let Some(i) = submenu(ui, sub_rect, accent, "Wi-Fi networks", nets) {
+                if let Some(i) = submenu(ui, sub_rect, accent, "Wi-Fi networks", nets, item_bg) {
                     if let Some(net) = win::list_wifi_networks().get(i) {
                         actions.push(ControlAction::ConnectWifi(net.ssid.clone()));
                     }
@@ -423,7 +439,7 @@ pub fn draw_control_center(
                     .iter()
                     .map(|(n, c)| (n.clone(), *c))
                     .collect();
-                let _ = submenu(ui, sub_rect, accent, "Bluetooth devices", devs);
+                let _ = submenu(ui, sub_rect, accent, "Bluetooth devices", devs, item_bg);
             }
             ControlSubmenu::Power | ControlSubmenu::None => {}
         }
@@ -435,27 +451,34 @@ pub fn draw_control_center(
                 egui::pos2(rect.left() + pad, y5),
                 egui::vec2(content_w, 96.0),
             );
-            ui.painter().rect_filled(card, egui::CornerRadius::same(22), egui::Color32::from_rgb(30, 30, 32));
-            let art_side = 72.0;
-            let art_rect = egui::Rect::from_min_size(
-                egui::pos2(card.left() + 14.0, card.center().y - art_side / 2.0),
-                egui::vec2(art_side, art_side),
-            );
-            ui.painter().image(
+            let corner = 22.0_f32;
+            let cr = egui::CornerRadius::same(corner as u8);
+            // Draw album cover clipped to card bounds.
+            let clipped = ui.painter().with_clip_rect(card);
+            let art_size = egui::vec2(card.width(), card.width());
+            let art_rect = egui::Rect::from_center_size(card.center(), art_size);
+            clipped.image(
                 art.id(),
                 art_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
+            drop(clipped);
+            // Dark overlay for text legibility.
+            ui.painter().rect_filled(card, cr, egui::Color32::from_rgba_premultiplied(0, 0, 0, 120));
+            // Round the corners using the background color.
+            let bg = Config::parse_color(&cfg.background);
+            let bg = egui::Color32::from_rgb(bg.r(), bg.g(), bg.b());
+            draw_corner_mask(ui, card, cr, bg);
             ui.painter().text(
-                egui::pos2(art_rect.right() + 14.0, card.center().y - 16.0),
+                egui::pos2(card.left() + 14.0, card.center().y - 12.0),
                 egui::Align2::LEFT_CENTER,
                 title,
                 egui::FontId::new(16.0, egui::FontFamily::Proportional),
                 egui::Color32::from_rgb(240, 240, 240),
             );
             ui.painter().text(
-                egui::pos2(art_rect.right() + 14.0, card.center().y + 6.0),
+                egui::pos2(card.left() + 14.0, card.center().y + 10.0),
                 egui::Align2::LEFT_CENTER,
                 artist,
                 egui::FontId::new(12.0, egui::FontFamily::Proportional),
@@ -470,4 +493,68 @@ pub fn draw_control_center(
     }
 
     actions
+}
+
+/// Draws corner patches to mask a rectangle's corners to a rounded rect shape.
+fn draw_corner_mask(ui: &egui::Ui, rect: egui::Rect, cr: egui::CornerRadius, color: egui::Color32) {
+    let r = cr.nw as f32;
+    let steps = 8;
+    let painter = ui.painter();
+    // Top-left
+    corner_mask(painter, rect.min, 1.0, 1.0, r, color, steps);
+    // Top-right
+    corner_mask(painter, egui::pos2(rect.right(), rect.top()), -1.0, 1.0, r, color, steps);
+    // Bottom-left
+    corner_mask(painter, egui::pos2(rect.left(), rect.bottom()), 1.0, -1.0, r, color, steps);
+    // Bottom-right
+    corner_mask(painter, rect.max, -1.0, -1.0, r, color, steps);
+}
+
+fn corner_mask(
+    painter: &egui::Painter,
+    corner: egui::Pos2,
+    dx: f32,
+    dy: f32,
+    r: f32,
+    bg: egui::Color32,
+    steps: usize,
+) {
+    let mut pts = Vec::with_capacity(steps + 2);
+    pts.push(corner);
+    for i in 0..=steps {
+        let t = std::f32::consts::FRAC_PI_2 * (i as f32 / steps as f32);
+        pts.push(corner + egui::vec2(dx * r * t.cos(), dy * r * t.sin()));
+    }
+    pts.push(corner);
+    painter.add(egui::epaint::PathShape::convex_polygon(
+        pts, bg, egui::Stroke::NONE,
+    ));
+}
+
+/// Truncates `text` with an ellipsis so its rendered width fits `max_w`.
+fn truncate_to_fit(painter: &egui::Painter, text: &str, font: &egui::FontId, max_w: f32) -> String {
+    if max_w <= 0.0 {
+        return String::new();
+    }
+    let measure = |s: &str| painter.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
+    if measure(text) <= max_w {
+        return text.to_string();
+    }
+    let ellipsis_w = measure("…");
+    let mut lo = 0usize;
+    let mut hi = text.chars().count();
+    let mut best = 0usize;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let prefix: String = text.chars().take(mid).collect();
+        if measure(&prefix) + ellipsis_w <= max_w {
+            best = mid;
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut out: String = text.chars().take(best).collect();
+    out.push('…');
+    out
 }

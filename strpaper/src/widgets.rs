@@ -93,6 +93,8 @@ struct PenSurface {
     pixels: Vec<u8>,
     /// Damage rectangle since the last snapshot: (x0, y0, x1, y1).
     bbox: Option<(usize, usize, usize, usize)>,
+    /// Global opacity applied when the frame is captured (0.0–1.0).
+    opacity: f32,
 }
 
 impl Pen {
@@ -142,9 +144,20 @@ impl Pen {
         }
         let row = (x1 - x0) * 4;
         let mut out = Vec::with_capacity(row * (y1 - y0));
+        let opa = s.opacity;
         for y in y0..y1 {
             let off = (y * s.w + x0) * 4;
-            out.extend_from_slice(&s.pixels[off..off + row]);
+            let slice = &s.pixels[off..off + row];
+            if opa < 1.0 {
+                for px in slice.chunks_exact(4) {
+                    out.push((px[0] as f32 * opa) as u8);
+                    out.push((px[1] as f32 * opa) as u8);
+                    out.push((px[2] as f32 * opa) as u8);
+                    out.push((px[3] as f32 * opa) as u8);
+                }
+            } else {
+                out.extend_from_slice(slice);
+            }
         }
         Some((x0, y0, x1, y1, out))
     }
@@ -159,11 +172,12 @@ impl Pen {
         if o + 3 >= s.pixels.len() {
             return;
         }
-        for i in 0..3 {
-            let dst = &mut s.pixels[o + i];
-            *dst = dst.saturating_add(premul[i]);
-        }
-        s.pixels[o + 3] = s.pixels[o + 3].max(premul[3]);
+        let a = premul[3] as u32;
+        let inv = 255 - a;
+        s.pixels[o] = (premul[0] as u32 + s.pixels[o] as u32 * inv / 255).min(255) as u8;
+        s.pixels[o + 1] = (premul[1] as u32 + s.pixels[o + 1] as u32 * inv / 255).min(255) as u8;
+        s.pixels[o + 2] = (premul[2] as u32 + s.pixels[o + 2] as u32 * inv / 255).min(255) as u8;
+        s.pixels[o + 3] = (a + s.pixels[o + 3] as u32 * inv / 255).min(255) as u8;
     }
 
     /// Solid premultiplied fill (src-over) with damage marking.
@@ -177,21 +191,20 @@ impl Pen {
             return;
         }
         self.mark(x0 as usize, y0 as usize, x1 as usize, y1 as usize);
-        let pm = [
-            ((rgba[2] as u16 * rgba[3] as u16) / 255) as u8,
-            ((rgba[1] as u16 * rgba[3] as u16) / 255) as u8,
-            ((rgba[0] as u16 * rgba[3] as u16) / 255) as u8,
-            rgba[3],
-        ];
+        let sa = rgba[3] as u32;
+        let inv = 255 - sa;
+        let pm_b = ((rgba[2] as u32 * sa) / 255) as u32;
+        let pm_g = ((rgba[1] as u32 * sa) / 255) as u32;
+        let pm_r = ((rgba[0] as u32 * sa) / 255) as u32;
         let mut s = self.inner.lock().unwrap();
         for yy in y0..y1 {
             let off = (yy as usize * s.w) + x0 as usize;
             for xx in 0..(x1 - x0) as usize {
                 let o = (off + xx) * 4;
-                s.pixels[o] = s.pixels[o].saturating_add(pm[0]);
-                s.pixels[o + 1] = s.pixels[o + 1].saturating_add(pm[1]);
-                s.pixels[o + 2] = s.pixels[o + 2].saturating_add(pm[2]);
-                s.pixels[o + 3] = s.pixels[o + 3].max(pm[3]);
+                s.pixels[o] = (pm_b + s.pixels[o] as u32 * inv / 255).min(255) as u8;
+                s.pixels[o + 1] = (pm_g + s.pixels[o + 1] as u32 * inv / 255).min(255) as u8;
+                s.pixels[o + 2] = (pm_r + s.pixels[o + 2] as u32 * inv / 255).min(255) as u8;
+                s.pixels[o + 3] = (sa + s.pixels[o + 3] as u32 * inv / 255).min(255) as u8;
             }
         }
     }
@@ -269,6 +282,13 @@ impl Pen {
         s.pixels.iter_mut().for_each(|b| *b = 0);
         let (w, h) = (s.w, s.h);
         s.bbox = Some((0, 0, w, h));
+        s.opacity = 1.0;
+    }
+
+    /// Set global opacity (0.0–1.0) applied to every pixel when the frame is
+    /// captured. Call at the top of `draw()` before any drawing.
+    pub fn set_opacity(&self, a: f32) {
+        self.inner.lock().unwrap().opacity = a.clamp(0.0, 1.0);
     }
 
     fn line(&mut self, x1: i64, y1: i64, x2: i64, y2: i64, thickness: i64, c: [u8; 4]) {
@@ -298,7 +318,15 @@ impl Pen {
     }
 
     fn text(&mut self, x: i64, y: i64, text: &str, px: i64, c: [u8; 4]) {
-        draw_text_buffer(self, x, y, text, px, c);
+        draw_text_buffer(self, x, y, text, px, c, "Segoe UI", 0);
+    }
+
+    fn text_font(&mut self, x: i64, y: i64, text: &str, px: i64, c: [u8; 4], font: &str) {
+        draw_text_buffer(self, x, y, text, px, c, font, 0);
+    }
+
+    fn text_font_spacing(&mut self, x: i64, y: i64, text: &str, px: i64, c: [u8; 4], font: &str, spacing: i64) {
+        draw_text_buffer(self, x, y, text, px, c, font, spacing);
     }
 
     fn cpu_percent(&mut self) -> i64 {
@@ -475,6 +503,10 @@ struct ScriptItem {
     hash: u64,
     /// True right after this widget produced pixels different from before.
     dirty: bool,
+    /// Last accumulated bounding box in the combined buffer, so we can erase
+    /// it before re-accumulating (prevents alpha buildup for semi-transparent
+    /// widgets).
+    last_bbox: Option<(usize, usize, usize, usize)>,
 }
 
 /// Runs widget scripts into per-widget canvases and accumulates their output
@@ -559,15 +591,18 @@ impl WidgetHost {
             };
             let hash = fnv_hash(&bytes);
             let blank = self.buf_is_blank_at(x0, y0, x1, y1);
-            {
-                let item = &mut self.items[i];
-                if hash != item.hash || blank {
-                    item.hash = hash;
-                    item.dirty = true;
-                    self.changed = true;
+            if hash != self.items[i].hash || blank {
+                let old_bbox = self.items[i].last_bbox;
+                if let Some((bx0, by0, bx1, by1)) = old_bbox {
+                    self.clear_buf_region(bx0, by0, bx1, by1);
                 }
+                self.accumulate(x0, y0, x1, y1, &bytes);
+                let item = &mut self.items[i];
+                item.hash = hash;
+                item.dirty = true;
+                item.last_bbox = Some((x0, y0, x1, y1));
+                self.changed = true;
             }
-            self.accumulate(x0, y0, x1, y1, &bytes);
         }
     }
 
@@ -583,6 +618,23 @@ impl WidgetHost {
             }
         }
         true
+    }
+
+    /// Zero out a rectangular region in the combined buffer so a widget can
+    /// re-accumulate without alpha buildup.
+    fn clear_buf_region(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        let cw = self.width;
+        for dy in y0..y1.min(self.height) {
+            for dx in x0..x1.min(cw) {
+                let o = (dy * cw + dx) * 4;
+                if o + 4 <= self.buf.len() {
+                    self.buf[o] = 0;
+                    self.buf[o + 1] = 0;
+                    self.buf[o + 2] = 0;
+                    self.buf[o + 3] = 0;
+                }
+            }
+        }
     }
 
     /// Blend one widget's premultiplied-BGRA region into the combined buffer.
@@ -713,6 +765,7 @@ impl WidgetHost {
                         pen,
                         hash: 0,
                         dirty: false,
+                        last_bbox: None,
                     })
                 }
                 Err(e) => crate::logger::log(&format!("widget {name}: {e}")),
@@ -731,6 +784,7 @@ fn make_engine() -> Engine {
     engine.register_type_with_name::<Pen>("Pen");
 
     engine.register_fn("clear", |p: &mut Pen| p.clear());
+    engine.register_fn("set_opacity", |p: &mut Pen, a: f64| p.set_opacity(a as f32));
     engine.register_fn("width", |p: &mut Pen| p.dims().0 as i64);
     engine.register_fn("height", |p: &mut Pen| p.dims().1 as i64);
 
@@ -752,6 +806,20 @@ fn make_engine() -> Engine {
         "text",
         |p: &mut Pen, x: i64, y: i64, text: &str, px: i64, color: &str| {
             p.text(x, y, text, px, parse_color(color));
+        },
+    );
+
+    engine.register_fn(
+        "text",
+        |p: &mut Pen, x: i64, y: i64, text: &str, px: i64, color: &str, font: &str| {
+            p.text_font(x, y, text, px, parse_color(color), font);
+        },
+    );
+
+    engine.register_fn(
+        "text",
+        |p: &mut Pen, x: i64, y: i64, text: &str, px: i64, color: &str, font: &str, spacing: i64| {
+            p.text_font_spacing(x, y, text, px, parse_color(color), font, spacing);
         },
     );
 
@@ -825,28 +893,122 @@ fn make_engine() -> Engine {
 // Text rendering (GDI scratch bitmap -> coverage mask -> tinted blend)
 // ---------------------------------------------------------------------------
 
-fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8; 4]) {
+/// Cache of loaded custom fonts: maps canonical path → (family name, resource ID).
+/// Fonts are loaded with FR_PRIVATE so they auto-remove on process exit.
+fn font_cache() -> &'static Mutex<HashMap<std::path::PathBuf, (String, i32)>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, (String, i32)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve a font parameter: if it looks like a file path, load the TTF and
+/// return its family name; otherwise return the string as-is.
+fn resolve_font(font: &str) -> String {
+    let p = std::path::Path::new(font);
+    if !p.is_absolute() && !p.exists() {
+        return font.to_string();
+    }
+    let Ok(canonical) = p.canonicalize() else {
+        return font.to_string();
+    };
+    {
+        let cache = font_cache().lock().unwrap();
+        if let Some((family, _)) = cache.get(&canonical) {
+            return family.clone();
+        }
+    }
+    // Parse the family name from the TTF name table
+    let family = std::fs::read(&canonical)
+        .ok()
+        .and_then(|data| {
+            let face = ttf_parser::Face::parse(&data, 0).ok()?;
+            face.names().into_iter().find_map(|n| {
+                if n.name_id == ttf_parser::name_id::FAMILY {
+                    n.to_string()
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| {
+            canonical
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(font)
+                .to_string()
+        });
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{AddFontResourceExW, FR_PRIVATE};
+        let wide_path: Vec<u16> = canonical
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let id = AddFontResourceExW(
+            windows::core::PCWSTR(wide_path.as_ptr()),
+            FR_PRIVATE,
+            None,
+        );
+        if id == 0 {
+            return font.to_string();
+        }
+        let mut cache = font_cache().lock().unwrap();
+        cache.insert(canonical, (family.clone(), id));
+    }
+    family
+}
+
+fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8; 4], font: &str, spacing: i64) {
     let (w, h) = pen.dims();
     if w == 0 || h == 0 || text.is_empty() {
         return;
     }
     let px = px_i.clamp(6, 400) as i32;
+    let family = resolve_font(font);
+
+    // Supersample factor: render at 4x then downsample for smooth antialiasing.
+    const S: usize = 4;
 
     unsafe {
-        use windows::core::w;
         use windows::Win32::Foundation::COLORREF;
+        use windows::Win32::Foundation::SIZE;
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GetDC,
-            ReleaseDC, SelectObject, SetBkMode, SetTextColor, TextOutW, BITMAPINFO,
-            BITMAPINFOHEADER, DIB_RGB_COLORS, TRANSPARENT,
+            GetTextExtentPoint32W, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TextOutW,
+            BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, TRANSPARENT,
         };
 
         let screen_dc = GetDC(None);
         let mem = CreateCompatibleDC(screen_dc);
         let _ = ReleaseDC(None, screen_dc);
 
-        let est_w = (px as f64 * 0.62 * text.chars().count() as f64).ceil() as i32 + 8;
-        let est_h = (px as f64 * 1.5).ceil() as i32 + 8;
+        let s = S as i32;
+        let spx = px * s;
+
+        // Create font first so we can measure text width.
+        let wide_font: Vec<u16> = family.encode_utf16().chain(std::iter::once(0)).collect();
+        let hf = CreateFontW(-spx, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 2, 0, windows::core::PCWSTR(wide_font.as_ptr()));
+        let old_font = SelectObject(mem, hf);
+
+        // Measure actual text width at supersampled size.
+        let mut text_sz = SIZE::default();
+        let wide_text: Vec<u16> = text.encode_utf16().collect();
+        let _ = GetTextExtentPoint32W(mem, &wide_text, &mut text_sz);
+
+        // Account for GDI overhang (italic/bold glyphs can extend past extent).
+        use windows::Win32::Graphics::Gdi::{GetTextMetricsW, TEXTMETRICW};
+        let mut tm = TEXTMETRICW::default();
+        let _ = GetTextMetricsW(mem, &mut tm);
+        let overhang = tm.tmOverhang;
+
+        let spacing_w = if spacing != 0 {
+            spacing.abs() as i32 * s * (text.chars().count() as i32 - 1).max(0)
+        } else {
+            0
+        };
+        let pad = (s * 8).max(overhang * s + s * 4);
+        let est_w = text_sz.cx + spacing_w + pad;
+        let est_h = text_sz.cy + pad;
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
         bmi.bmiHeader.biWidth = est_w;
@@ -863,32 +1025,50 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
             }
         };
         let old_bmp = SelectObject(mem, bmp);
-        let hf = CreateFontW(-px, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 2, 0, w!("Segoe UI"));
-        let old_font = SelectObject(mem, hf);
         let _ = SetBkMode(mem, TRANSPARENT);
         let _ = SetTextColor(mem, COLORREF(0x00FF_FFFF)); // white glyphs
 
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        let _ = TextOutW(mem, 0, 0, &wide);
+        if spacing == 0 {
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let _ = TextOutW(mem, s, s, &wide);
+        } else {
+            let mut cx: i32 = s;
+            let mut buf = [0u16; 2];
+            for ch in text.chars() {
+                let len = ch.encode_utf16(&mut buf);
+                let _ = TextOutW(mem, cx, s, len);
+                let mut sz = SIZE::default();
+                let _ = GetTextExtentPoint32W(mem, len, &mut sz);
+                cx += sz.cx + spacing as i32 * s;
+            }
+        }
 
+        // Downsample the supersampled coverage mask by averaging S×S blocks.
         let stride = est_w as usize * 4;
         let data = std::slice::from_raw_parts(bits.cast::<u8>(), stride * est_h as usize);
-        for gy in 0..est_h as usize {
+        for gy in 0..est_h as usize / S {
             let dy = y as usize + gy;
             if dy >= h {
                 break;
             }
-            for gx in 0..est_w as usize {
+            for gx in 0..est_w as usize / S {
                 let dx = x as usize + gx;
                 if dx >= w {
                     break;
                 }
-                let so = gy * stride + gx * 4;
-                let cov = data[so].max(data[so + 1]).max(data[so + 2]);
+                let mut sum: u32 = 0;
+                for sy in 0..S as usize {
+                    for sx in 0..S as usize {
+                        let so = (gy * S as usize + sy) * stride + (gx * S as usize + sx) * 4;
+                        let cov = data[so].max(data[so + 1]).max(data[so + 2]) as u32;
+                        sum += cov;
+                    }
+                }
+                let cov = (sum / (S * S) as u32) as u32;
                 if cov == 0 {
                     continue;
                 }
-                let a = ((cov as u32) * (c[3] as u32)) / 255;
+                let a = (cov * c[3] as u32) / 255;
                 pen.blend_px(
                     dx,
                     dy,
@@ -983,6 +1163,12 @@ fn svg_cache() -> &'static Mutex<SvgCache> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub fn clear_svg_cache() {
+    if let Ok(mut cache) = svg_cache().lock() {
+        cache.clear();
+    }
+}
+
 /// Rasterise SVG bytes into straight-alpha RGBA pixels of size `(tw x th)`.
 fn render_svg(data: &[u8], tw: u32, th: u32) -> Option<Vec<u8>> {
     use resvg::tiny_skia;
@@ -1022,11 +1208,19 @@ fn render_svg(data: &[u8], tw: u32, th: u32) -> Option<Vec<u8>> {
 
 fn resolve_widget_path(path: &str) -> PathBuf {
     let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        crate::storage::wallpaper_dir().join(p)
+    if p.is_absolute() && p.exists() {
+        return p.to_path_buf();
     }
+    let base = crate::storage::wallpaper_dir();
+    let candidate = base.join(p);
+    if candidate.exists() {
+        return candidate;
+    }
+    let widgets = base.join("widgets").join(p);
+    if widgets.exists() {
+        return widgets;
+    }
+    candidate
 }
 
 /// Nearest-neighbour resize of raw RGBA pixels.
@@ -1134,15 +1328,17 @@ fn load_image_cached(resolved: &Path) -> Option<(u32, u32, Arc<Vec<u8>>)> {
 fn blend_rgba_at(pen: &Pen, x: i64, y: i64, w: usize, h: usize, rgba: &[u8]) {
     let mut s = pen.inner.lock().unwrap();
     for row in 0..h {
-        let dy = y as usize + row;
-        if dy >= s.h {
-            break;
+        let dy = y + row as i64;
+        if dy < 0 || dy >= s.h as i64 {
+            continue;
         }
+        let dy = dy as usize;
         for col in 0..w {
-            let dx = x as usize + col;
-            if dx >= s.w {
-                break;
+            let dx = x + col as i64;
+            if dx < 0 || dx >= s.w as i64 {
+                continue;
             }
+            let dx = dx as usize;
             let so = (row * w + col) * 4;
             if so + 4 > rgba.len() {
                 break;
@@ -1151,15 +1347,15 @@ fn blend_rgba_at(pen: &Pen, x: i64, y: i64, w: usize, h: usize, rgba: &[u8]) {
             if a == 0 {
                 continue;
             }
-            let a_premul = a as f64 / 255.0;
             let d = (dy * s.w + dx) * 4;
-            // Premultiply source channels and blend onto existing premultiplied dst
-            s.pixels[d] = ((rgba[so + 2] as f64 * a_premul) as u8).saturating_add(s.pixels[d]);
-            s.pixels[d + 1] = ((rgba[so + 1] as f64 * a_premul) as u8).saturating_add(s.pixels[d + 1]);
-            s.pixels[d + 2] = ((rgba[so] as f64 * a_premul) as u8).saturating_add(s.pixels[d + 2]);
-            // Alpha compositing: out_a = src_a + dst_a * (1 - src_a)
-            let inv = 255 - a as u8;
-            s.pixels[d + 3] = a as u8 + ((s.pixels[d + 3] as u16 * inv as u16) / 255) as u8;
+            let inv = 255 - a;
+            let src_r = ((rgba[so + 2] as u32 * a) / 255) as u32;
+            let src_g = ((rgba[so + 1] as u32 * a) / 255) as u32;
+            let src_b = ((rgba[so] as u32 * a) / 255) as u32;
+            s.pixels[d] = (src_r + s.pixels[d] as u32 * inv / 255).min(255) as u8;
+            s.pixels[d + 1] = (src_g + s.pixels[d + 1] as u32 * inv / 255).min(255) as u8;
+            s.pixels[d + 2] = (src_b + s.pixels[d + 2] as u32 * inv / 255).min(255) as u8;
+            s.pixels[d + 3] = (a + s.pixels[d + 3] as u32 * inv / 255).min(255) as u8;
         }
     }
 }

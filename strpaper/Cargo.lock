@@ -1013,6 +1013,7 @@ dependencies = [
  "notify",
  "resvg",
  "rhai",
+ "ttf-parser",
  "ureq",
  "windows",
 ]

@@ -491,6 +491,7 @@ impl App {
             None => return,
         };
         let host = widgets::WidgetHost::rebuild(size, &self.dir);
+        widgets::clear_svg_cache();
         self.widget_host = Some(host);
     }
 
