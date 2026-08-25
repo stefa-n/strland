@@ -611,6 +611,8 @@ impl DynamicIslandApp {
                 moon: render_svg_texture(ctx, "cc-moon", CONTROL_MOON_SVG, icon_px),
                 night: render_svg_texture(ctx, "cc-night", CONTROL_NIGHT_SVG, icon_px),
                 power: render_svg_texture(ctx, "cc-power", POWER_OFF_SVG, icon_px),
+                wallpaper: render_svg_texture(ctx, "cc-wallpaper", WALLPAPER_SVG, icon_px),
+                theme: render_svg_texture(ctx, "cc-theme", THEME_SVG, icon_px),
             });
         }
 
@@ -1095,7 +1097,7 @@ impl eframe::App for DynamicIslandApp {
             egui::Id::new("island_pill"),
         ));
         let accent = Config::parse_color(&self.cfg.accent_color);
-        let background = Config::parse_color(&self.cfg.status_button_background);
+        let background = Config::parse_color(&self.cfg.background);
         let font_id = egui::FontId::new(self.cfg.font_size, egui::FontFamily::Proportional);
 
         if !morphing {
@@ -1665,6 +1667,8 @@ const POWER_OFF_SVG: &str = include_str!("assets/power_off.svg");
 const CONTROL_AUDIO_SVG: &str = include_str!("assets/control_audio.svg");
 const CONTROL_MOON_SVG: &str = include_str!("assets/control_moon.svg");
 const CONTROL_NIGHT_SVG: &str = include_str!("assets/control_night.svg");
+const WALLPAPER_SVG: &str = include_str!("assets/wallpaper.svg");
+const THEME_SVG: &str = include_str!("assets/theme.svg");
 
 /// Rasterizes an SVG asset into an egui texture at the given pixel size.
 /// The SVG is drawn white so it can be tinted with any color when painted.

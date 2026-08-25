@@ -449,7 +449,8 @@ impl App {
         }
         let (_x, _y, w, h) = desktop::bounds(&self.monitors);
         if w > 0 && h > 0 {
-            Some((w as u32, h as u32))
+            let sc = widgets::dpi_scale();
+            Some(((w as f64 * sc).ceil() as u32, (h as f64 * sc).ceil() as u32))
         } else {
             None
         }

@@ -41,6 +41,17 @@ pub fn widgets_dir(wallpaper_dir: &std::path::Path) -> std::path::PathBuf {
     dir
 }
 
+/// Returns the system DPI scale factor (1.0 = 96 DPI, 1.25 = 120 DPI, etc.).
+pub(crate) fn dpi_scale() -> f64 {
+    static CACHE: OnceLock<f64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        unsafe {
+            use windows::Win32::UI::HiDpi::GetDpiForSystem;
+            GetDpiForSystem() as f64 / 96.0
+        }
+    })
+}
+
 /// Write an example widget so the feature is discoverable.
 pub fn ensure_sample(dir: &std::path::Path) {
     let sample = dir.join("clock.rhai");
@@ -95,6 +106,10 @@ struct PenSurface {
     bbox: Option<(usize, usize, usize, usize)>,
     /// Global opacity applied when the frame is captured (0.0–1.0).
     opacity: f32,
+    /// DPI scale factor (e.g. 1.5 for 150%). Coordinates from scripts are
+    /// multiplied by this before touching pixels, so scripts use logical
+    /// coordinates and everything renders at physical resolution.
+    scale: f64,
 }
 
 impl Pen {
@@ -104,20 +119,34 @@ impl Pen {
         }
     }
 
+    fn set_scale(&self, sc: f64) {
+        self.inner.lock().unwrap().scale = sc;
+    }
+
     fn set_region(&self, w: usize, h: usize) {
         let mut s = self.inner.lock().unwrap();
         if s.w != w || s.h != h {
             s.w = w;
             s.h = h;
-            s.pixels = vec![0u8; w * h * 4];
-            s.bbox = Some((0, 0, w, h));
+            let pw = (w as f64 * s.scale).ceil() as usize;
+            let ph = (h as f64 * s.scale).ceil() as usize;
+            s.pixels = vec![0u8; pw * ph * 4];
+            s.bbox = Some((0, 0, pw, ph));
         }
     }
 
-    /// `(w, h)` of the surface.
+    /// Logical `(w, h)` — what scripts see.
     pub fn dims(&self) -> (usize, usize) {
         let s = self.inner.lock().unwrap();
         (s.w, s.h)
+    }
+
+    /// Physical pixel dimensions (logical × scale).
+    fn phys(&self) -> (usize, usize) {
+        let s = self.inner.lock().unwrap();
+        let pw = (s.w as f64 * s.scale).ceil() as usize;
+        let ph = (s.h as f64 * s.scale).ceil() as usize;
+        (pw, ph)
     }
 
     fn mark(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
@@ -142,11 +171,12 @@ impl Pen {
         if s.pixels.is_empty() || x1 <= x0 || y1 <= y0 {
             return None;
         }
+        let pw = (s.w as f64 * s.scale).ceil() as usize;
         let row = (x1 - x0) * 4;
         let mut out = Vec::with_capacity(row * (y1 - y0));
         let opa = s.opacity;
         for y in y0..y1 {
-            let off = (y * s.w + x0) * 4;
+            let off = (y * pw + x0) * 4;
             let slice = &s.pixels[off..off + row];
             if opa < 1.0 {
                 for px in slice.chunks_exact(4) {
@@ -165,10 +195,12 @@ impl Pen {
     /// Blend one premultiplied pixel (src-over) with bounds checking.
     fn blend_px(&mut self, x: usize, y: usize, premul: [u8; 4]) {
         let mut s = self.inner.lock().unwrap();
-        if x >= s.w || y >= s.h {
+        let pw = (s.w as f64 * s.scale).ceil() as usize;
+        let ph = (s.h as f64 * s.scale).ceil() as usize;
+        if x >= pw || y >= ph {
             return;
         }
-        let o = (y * s.w + x) * 4;
+        let o = (y * pw + x) * 4;
         if o + 3 >= s.pixels.len() {
             return;
         }
@@ -182,11 +214,13 @@ impl Pen {
 
     /// Solid premultiplied fill (src-over) with damage marking.
     fn fill_solid(&mut self, x: i64, y: i64, w: i64, h: i64, rgba: [u8; 4]) {
-        let (sw, sh) = (self.dims().0 as i64, self.dims().1 as i64);
-        let x0 = x.max(0);
-        let y0 = y.max(0);
-        let x1 = (x + w).min(sw);
-        let y1 = (y + h).min(sh);
+        let (sc, lw, lh) = { let s = self.inner.lock().unwrap(); (s.scale, s.w, s.h) };
+        let pw = (lw as f64 * sc).ceil() as i64;
+        let ph = (lh as f64 * sc).ceil() as i64;
+        let x0 = ((x as f64 * sc) as i64).max(0);
+        let y0 = ((y as f64 * sc) as i64).max(0);
+        let x1 = (((x + w) as f64 * sc).ceil() as i64).min(pw);
+        let y1 = (((y + h) as f64 * sc).ceil() as i64).min(ph);
         if x1 <= x0 || y1 <= y0 {
             return;
         }
@@ -197,8 +231,9 @@ impl Pen {
         let pm_g = ((rgba[1] as u32 * sa) / 255) as u32;
         let pm_r = ((rgba[0] as u32 * sa) / 255) as u32;
         let mut s = self.inner.lock().unwrap();
-        for yy in y0..y1 {
-            let off = (yy as usize * s.w) + x0 as usize;
+        let pw = pw as usize;
+        for yy in y0 as usize..y1 as usize {
+            let off = yy * pw + x0 as usize;
             for xx in 0..(x1 - x0) as usize {
                 let o = (off + xx) * 4;
                 s.pixels[o] = (pm_b + s.pixels[o] as u32 * inv / 255).min(255) as u8;
@@ -233,11 +268,17 @@ impl Pen {
 
     /// Draw a filled circle.
     pub fn fill_circle(&mut self, cx: i64, cy: i64, r: i64, c: [u8; 4]) {
-        let rf = r as f64;
-        for dy in -r..=r {
-            for dx in -r..=r {
+        let sc = { self.inner.lock().unwrap().scale };
+        let scx = (cx as f64 * sc) as i64;
+        let scy = (cy as f64 * sc) as i64;
+        let sr = (r as f64 * sc).ceil() as i64;
+        let rf = sr as f64;
+        for dy in -sr..=sr {
+            for dx in -sr..=sr {
                 if (dx * dx + dy * dy) as f64 <= rf * rf {
-                    self.blend_px((cx + dx) as usize, (cy + dy) as usize, premul_bgra(c));
+                    let px = (scx + dx) as usize;
+                    let py = (scy + dy) as usize;
+                    self.blend_px(px, py, premul_bgra(c));
                 }
             }
         }
@@ -280,8 +321,9 @@ impl Pen {
     pub fn clear(&mut self) {
         let mut s = self.inner.lock().unwrap();
         s.pixels.iter_mut().for_each(|b| *b = 0);
-        let (w, h) = (s.w, s.h);
-        s.bbox = Some((0, 0, w, h));
+        let pw = (s.w as f64 * s.scale).ceil() as usize;
+        let ph = (s.h as f64 * s.scale).ceil() as usize;
+        s.bbox = Some((0, 0, pw, ph));
         s.opacity = 1.0;
     }
 
@@ -350,6 +392,14 @@ impl Pen {
 
     fn battery(&mut self) -> i64 {
         crate::sysdata::battery().percent
+    }
+
+    fn dpi_scale(&self) -> f64 {
+        unsafe {
+            use windows::Win32::UI::HiDpi::{GetDpiForSystem};
+            let dpi = GetDpiForSystem();
+            dpi as f64 / 96.0
+        }
     }
 
     fn charging(&mut self) -> bool {
@@ -713,10 +763,13 @@ impl WidgetHost {
         ensure_sample(&dir);
 
         let (cw, ch) = (size.0.max(1) as usize, size.1.max(1) as usize);
+        let sc = dpi_scale();
+        let pw = (cw as f64 * sc).ceil() as usize;
+        let ph = (ch as f64 * sc).ceil() as usize;
         let mut host = WidgetHost {
-            width: cw,
-            height: ch,
-            buf: vec![0u8; cw * ch * 4],
+            width: pw,
+            height: ph,
+            buf: vec![0u8; pw * ph * 4],
             items: Vec::new(),
             changed: false,
         };
@@ -755,6 +808,7 @@ impl WidgetHost {
             match res {
                 Ok((engine, ast, interval)) => {
                     let pen = Pen::new();
+                    pen.set_scale(dpi_scale());
                     pen.set_region(cw, ch);
                     host.items.push(ScriptItem {
                         name,
@@ -846,6 +900,7 @@ fn make_engine() -> Engine {
     // Battery
     engine.register_fn("battery", |p: &mut Pen| p.battery());
     engine.register_fn("charging", |p: &mut Pen| p.charging());
+    engine.register_fn("dpi_scale", |p: &Pen| p.dpi_scale());
 
     // Bluetooth devices
     engine.register_fn("bt_count", |p: &mut Pen| p.bt_count());
@@ -963,11 +1018,18 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
     if w == 0 || h == 0 || text.is_empty() {
         return;
     }
-    let px = px_i.clamp(6, 400) as i32;
+    let sc = { pen.inner.lock().unwrap().scale };
+    let px = ((px_i as f64 * sc) as i64).clamp(6, 400) as i32;
     let family = resolve_font(font);
 
     // Supersample factor: render at 4x then downsample for smooth antialiasing.
     const S: usize = 4;
+
+    // Scale logical coordinates to physical pixel space.
+    let phys_x = (x as f64 * sc) as i64;
+    let phys_y = (y as f64 * sc) as i64;
+    let phys_spacing = (spacing as f64 * sc) as i64;
+    let (pw, ph) = pen.phys();
 
     unsafe {
         use windows::Win32::Foundation::COLORREF;
@@ -1039,7 +1101,7 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
                 let _ = TextOutW(mem, cx, s, len);
                 let mut sz = SIZE::default();
                 let _ = GetTextExtentPoint32W(mem, len, &mut sz);
-                cx += sz.cx + spacing as i32 * s;
+                cx += sz.cx + phys_spacing as i32 * s;
             }
         }
 
@@ -1047,13 +1109,13 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
         let stride = est_w as usize * 4;
         let data = std::slice::from_raw_parts(bits.cast::<u8>(), stride * est_h as usize);
         for gy in 0..est_h as usize / S {
-            let dy = y as usize + gy;
-            if dy >= h {
+            let dy = phys_y as usize + gy;
+            if dy >= ph {
                 break;
             }
             for gx in 0..est_w as usize / S {
-                let dx = x as usize + gx;
-                if dx >= w {
+                let dx = phys_x as usize + gx;
+                if dx >= pw {
                     break;
                 }
                 let mut sum: u32 = 0;
@@ -1325,17 +1387,23 @@ fn load_image_cached(resolved: &Path) -> Option<(u32, u32, Arc<Vec<u8>>)> {
 }
 
 /// Blend an RGBA pixel buffer onto the canvas at `(x, y)` with dimensions `(w, h)`.
+/// Coordinates are in logical space; the function scales to physical pixels.
 fn blend_rgba_at(pen: &Pen, x: i64, y: i64, w: usize, h: usize, rgba: &[u8]) {
     let mut s = pen.inner.lock().unwrap();
+    let sc = s.scale;
+    let pw = (s.w as f64 * sc).ceil() as i64;
+    let ph = (s.h as f64 * sc).ceil() as i64;
+    let sx = (x as f64 * sc) as i64;
+    let sy = (y as f64 * sc) as i64;
     for row in 0..h {
-        let dy = y + row as i64;
-        if dy < 0 || dy >= s.h as i64 {
+        let dy = sy + row as i64;
+        if dy < 0 || dy >= ph {
             continue;
         }
         let dy = dy as usize;
         for col in 0..w {
-            let dx = x + col as i64;
-            if dx < 0 || dx >= s.w as i64 {
+            let dx = sx + col as i64;
+            if dx < 0 || dx >= pw {
                 continue;
             }
             let dx = dx as usize;
@@ -1347,7 +1415,7 @@ fn blend_rgba_at(pen: &Pen, x: i64, y: i64, w: usize, h: usize, rgba: &[u8]) {
             if a == 0 {
                 continue;
             }
-            let d = (dy * s.w + dx) * 4;
+            let d = (dy * pw as usize + dx) * 4;
             let inv = 255 - a;
             let src_r = ((rgba[so + 2] as u32 * a) / 255) as u32;
             let src_g = ((rgba[so + 1] as u32 * a) / 255) as u32;

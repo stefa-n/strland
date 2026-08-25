@@ -254,14 +254,51 @@ impl VideoPlayer {
     pub fn active_secs(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
     }
+
+    /// Signal the decode thread to stop and wait for it to finish.
+    /// Returns after at most `timeout`; the thread is detached if it doesn't
+    /// exit in time (same as the old Drop behaviour).
+    pub fn close(&mut self, timeout: Duration) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            // Spin-wait up to `timeout` for the thread to notice `stop` and
+            // exit.  Joining directly would block forever if ReadSample is
+            // stuck, so we park the main thread in small increments instead.
+            let deadline = Instant::now() + timeout;
+            while !h.is_finished() {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // If the thread finished in time, join it to release resources
+            // cleanly.  If not, we just drop the handle (detach).
+            if h.is_finished() {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // Detach the thread rather than join: if `ReadSample` is blocked the
-        // join would hang the process. The OS reclaims the thread at exit.
-        self.handle.take();
+        if let Some(h) = self.handle.take() {
+            // Try to join cleanly within a short timeout so COM resources are
+            // released before the process exits or a new player starts.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !h.is_finished() {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
+            // If the thread didn't finish in time it is detached — the OS
+            // reclaims it at process exit.
+        }
     }
 }
 
@@ -349,6 +386,12 @@ fn run_loop(
         }
     }
 
+    // Release COM objects *before* uninitialising COM.  Dropping
+    // IMFSourceReader / D3D11 resources after CoUninitialize causes
+    // access-violations when switching wallpapers.
+    drop(reader);
+    drop(gpu);
+    drop(data);
     let _ = unsafe { CoUninitialize() };
 }
 

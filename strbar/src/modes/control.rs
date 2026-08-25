@@ -11,6 +11,8 @@ pub struct ControlCenterIcons {
     pub moon: egui::TextureHandle,
     pub night: egui::TextureHandle,
     pub power: egui::TextureHandle,
+    pub wallpaper: egui::TextureHandle,
+    pub theme: egui::TextureHandle,
 }
 
 /// Which submenu the control center is currently showing.
@@ -388,11 +390,11 @@ pub fn draw_control_center(
         egui::pos2(rect.left() + pad + pill_w + gap, y_pills),
         egui::vec2(pill_w, pill_h),
     );
-    let wp_zone = tile(ui, wp_rect, "Wallpapers", "Pick wallpaper", None, accent, 1.0, false, item_bg, bg);
+    let wp_zone = tile(ui, wp_rect, "Wallpapers", "Pick wallpaper", Some(&icons.wallpaper), accent, 1.0, false, item_bg, bg);
     if wp_zone != TileZone::None {
         actions.push(ControlAction::OpenWallpapers);
     }
-    let th_zone = tile(ui, th_rect, "Themes", "Switch theme", None, accent, 1.0, false, item_bg, bg);
+    let th_zone = tile(ui, th_rect, "Themes", "Switch theme", Some(&icons.theme), accent, 1.0, false, item_bg, bg);
     if th_zone != TileZone::None {
         actions.push(ControlAction::OpenThemes);
     }
