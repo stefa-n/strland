@@ -28,6 +28,13 @@ use std::time::{Duration, Instant};
 
 use rhai::{Engine, Scope};
 
+/// Fixed virtual canvas that all widget scripts draw into.  Every script
+/// sees `width() = VIRTUAL_W` and `height() = VIRTUAL_H` regardless of
+/// the actual monitor resolution.  The pen scales coordinates to the
+/// physical buffer automatically.
+const VIRTUAL_W: usize = 2880;
+const VIRTUAL_H: usize = 1620;
+
 /// Default frames per second a widget re-runs its script at. Scripts can
 /// override this per widget with an optional `fn fps()` (clamped 1-120).
 const WIDGET_FPS: u64 = 30;
@@ -136,9 +143,9 @@ impl Pen {
     }
 
     /// Logical `(w, h)` — what scripts see.
+    /// Always returns the fixed virtual canvas size.
     pub fn dims(&self) -> (usize, usize) {
-        let s = self.inner.lock().unwrap();
-        (s.w, s.h)
+        (VIRTUAL_W, VIRTUAL_H)
     }
 
     /// Physical pixel dimensions (logical × scale).
@@ -774,6 +781,11 @@ impl WidgetHost {
             changed: false,
         };
 
+        // Scale from the virtual canvas (VIRTUAL_W×VIRTUAL_H) to the
+        // physical pixel buffer (pw×ph).  On 16:9 monitors the ratio is
+        // identical for both axes so a single scale factor works.
+        let pen_scale = pw as f64 / VIRTUAL_W as f64;
+
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return host;
         };
@@ -808,8 +820,8 @@ impl WidgetHost {
             match res {
                 Ok((engine, ast, interval)) => {
                     let pen = Pen::new();
-                    pen.set_scale(dpi_scale());
-                    pen.set_region(cw, ch);
+                    pen.set_scale(pen_scale);
+                    pen.set_region(VIRTUAL_W, VIRTUAL_H);
                     host.items.push(ScriptItem {
                         name,
                         engine,
