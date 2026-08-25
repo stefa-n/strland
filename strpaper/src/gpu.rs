@@ -11,7 +11,7 @@ use std::cell::RefCell;
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE,
+    D3D_DRIVER_TYPE_UNKNOWN,
 };
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
@@ -59,13 +59,59 @@ struct Pipeline {
 
 impl Gpu {
     /// Create a hardware D3D11 device and register it with Media Foundation.
+    ///
+    /// Enumerates DXGI adapters to prefer the discrete GPU (NVIDIA / AMD)
+    /// instead of the default adapter, which on hybrid laptops is often the
+    /// weak integrated GPU.
     pub fn new() -> Result<Gpu, String> {
         unsafe {
+            use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIAdapter};
+
+            let factory: IDXGIFactory1 =
+                CreateDXGIFactory1().map_err(|e| format!("CreateDXGIFactory1 failed: {e}"))?;
+
+            // Prefer the first adapter whose description contains "NVIDIA" or
+            // "AMD" (discrete GPU).  Fall back to the first hardware adapter.
+            let mut best: Option<IDXGIAdapter> = None;
+            let mut fallback: Option<IDXGIAdapter> = None;
+            for i in 0.. {
+                let adapter = match factory.EnumAdapters1(i) {
+                    Ok(a) => a,
+                    Err(_) => break,
+                };
+                let desc = match adapter.GetDesc1() {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let name = String::from_utf16_lossy(
+                    &desc.Description[..desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len())]
+                );
+                let lower = name.to_ascii_lowercase();
+                if lower.contains("nvidia") || lower.contains("amd") || lower.contains("radeon") {
+                    best = Some(adapter.into());
+                    break;
+                }
+                if fallback.is_none() {
+                    fallback = Some(adapter.into());
+                }
+            }
+
+            let adapter = best.or(fallback)
+                .ok_or("no DXGI hardware adapter found")?;
+
+            // Log the selected adapter so the user can verify the right GPU.
+            if let Ok(d) = adapter.GetDesc() {
+                let name = String::from_utf16_lossy(
+                    &d.Description[..d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len())]
+                );
+                crate::logger::log(&format!("GPU: using adapter \"{name}\""));
+            }
+
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
             D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
+                Some(&adapter),
+                D3D_DRIVER_TYPE_UNKNOWN,
                 windows::Win32::Foundation::HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 None,

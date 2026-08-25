@@ -117,6 +117,8 @@ struct PenSurface {
     /// multiplied by this before touching pixels, so scripts use logical
     /// coordinates and everything renders at physical resolution.
     scale: f64,
+    /// Persistent key-value store that survives across `call_fn` invocations.
+    state: HashMap<String, rhai::Dynamic>,
 }
 
 impl Pen {
@@ -154,6 +156,19 @@ impl Pen {
         let pw = (s.w as f64 * s.scale).ceil() as usize;
         let ph = (s.h as f64 * s.scale).ceil() as usize;
         (pw, ph)
+    }
+
+    /// Read a value from persistent key-value state (survives across `call_fn` calls).
+    /// Returns `0` if the key has not been set.
+    fn state(&self, key: &str) -> rhai::Dynamic {
+        let s = self.inner.lock().unwrap();
+        s.state.get(key).cloned().unwrap_or(rhai::Dynamic::from(0_i64))
+    }
+
+    /// Write a value to persistent key-value state.
+    fn set_state(&self, key: &str, val: rhai::Dynamic) {
+        let mut s = self.inner.lock().unwrap();
+        s.state.insert(key.to_string(), val);
     }
 
     fn mark(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
@@ -197,6 +212,43 @@ impl Pen {
             }
         }
         Some((x0, y0, x1, y1, out))
+    }
+
+    /// Read the current pixel data at a given region without modifying any
+    /// state (unlike `take_frame` which resets `bbox`). Used by the host to
+    /// re-composite non-due widgets when any widget changes.
+    fn peek_frame(&self, bx0: usize, by0: usize, bx1: usize, by1: usize) -> Option<Vec<u8>> {
+        let s = self.inner.lock().unwrap();
+        if s.pixels.is_empty() || bx1 <= bx0 || by1 <= by0 {
+            return None;
+        }
+        let pw = (s.w as f64 * s.scale).ceil() as usize;
+        let ph = (s.h as f64 * s.scale).ceil() as usize;
+        let bx0 = bx0.min(pw);
+        let by0 = by0.min(ph);
+        let bx1 = bx1.min(pw);
+        let by1 = by1.min(ph);
+        if bx1 <= bx0 || by1 <= by0 {
+            return None;
+        }
+        let row = (bx1 - bx0) * 4;
+        let mut out = Vec::with_capacity(row * (by1 - by0));
+        let opa = s.opacity;
+        for y in by0..by1 {
+            let off = (y * pw + bx0) * 4;
+            let slice = &s.pixels[off..off + row];
+            if opa < 1.0 {
+                for px in slice.chunks_exact(4) {
+                    out.push((px[0] as f32 * opa) as u8);
+                    out.push((px[1] as f32 * opa) as u8);
+                    out.push((px[2] as f32 * opa) as u8);
+                    out.push((px[3] as f32 * opa) as u8);
+                }
+            } else {
+                out.extend_from_slice(slice);
+            }
+        }
+        Some(out)
     }
 
     /// Blend one premultiplied pixel (src-over) with bounds checking.
@@ -293,36 +345,81 @@ impl Pen {
 
     /// Draw a rounded rectangle (filled).
     pub fn fill_round_rect(&mut self, x: i64, y: i64, w: i64, h: i64, radius: i64, c: [u8; 4]) {
+        if w <= 0 || h <= 0 || radius <= 0 {
+            return;
+        }
+        let (sc, lw, lh) = { let s = self.inner.lock().unwrap(); (s.scale, s.w, s.h) };
+        let pw = (lw as f64 * sc).ceil() as i64;
+        let ph = (lh as f64 * sc).ceil() as i64;
         // Main body
         self.fill_solid(x, y + radius, w, h - radius * 2, c);
         // Top and bottom strips
         self.fill_solid(x + radius, y, w - radius * 2, radius, c);
         self.fill_solid(x + radius, y + h - radius, w - radius * 2, radius, c);
-        // Corner arcs (filled circles at corners, clipped by surrounding fills)
+        // Corner arcs with anti-aliased edges.
         let rf = radius as f64;
+        let mut corners: Vec<(i64, i64, u8)> = Vec::new();
         for dy in -radius..=radius {
             for dx in -radius..=radius {
                 let dist = ((dx * dx + dy * dy) as f64).sqrt();
-                if dist <= rf {
-                    // Top-left corner
-                    if x + radius + dx >= x && y + radius + dy >= y && dx < 0 && dy < 0 {
-                        self.fill_solid(x + radius + dx, y + radius + dy, 1, 1, c);
-                    }
-                    // Top-right
-                    if x + w - radius + dx < x + w && y + radius + dy >= y && dx >= 0 && dy < 0 {
-                        self.fill_solid(x + w - radius + dx, y + radius + dy, 1, 1, c);
-                    }
-                    // Bottom-left
-                    if x + radius + dx >= x && y + h - radius + dy < y + h && dx < 0 && dy >= 0 {
-                        self.fill_solid(x + radius + dx, y + h - radius + dy, 1, 1, c);
-                    }
-                    // Bottom-right
-                    if x + w - radius + dx < x + w && y + h - radius + dy < y + h && dx >= 0 && dy >= 0 {
-                        self.fill_solid(x + w - radius + dx, y + h - radius + dy, 1, 1, c);
+                if dist > rf + 1.0 {
+                    continue;
+                }
+                let alpha = if dist <= rf - 1.0 {
+                    1.0
+                } else if dist <= rf + 1.0 {
+                    (rf + 1.0 - dist) / 2.0
+                } else {
+                    continue;
+                };
+                let corner_a = (c[3] as f64 * alpha) as u8;
+                if corner_a == 0 {
+                    continue;
+                }
+                let (cx, cy) = if dx < 0 && dy < 0 {
+                    (x + radius + dx, y + radius + dy)
+                } else if dx >= 0 && dy < 0 {
+                    (x + w - 1 - radius + dx, y + radius + dy)
+                } else if dx < 0 && dy >= 0 {
+                    (x + radius + dx, y + h - 1 - radius + dy)
+                } else {
+                    (x + w - 1 - radius + dx, y + h - 1 - radius + dy)
+                };
+                corners.push((cx, cy, corner_a));
+            }
+        }
+        if corners.is_empty() {
+            return;
+        }
+        let mut s = self.inner.lock().unwrap();
+        for (cx, cy, ca) in &corners {
+            let x0 = ((*cx as f64 * sc) as i64).max(0);
+            let y0 = ((*cy as f64 * sc) as i64).max(0);
+            let x1 = (((*cx + 1) as f64 * sc).ceil() as i64).max(x0 + 1).min(pw);
+            let y1 = (((*cy + 1) as f64 * sc).ceil() as i64).max(y0 + 1).min(ph);
+            let a = *ca as u32;
+            let inv = 255 - a;
+            let pr = ((c[2] as u32 * a) / 255) as u8;
+            let pg = ((c[1] as u32 * a) / 255) as u8;
+            let pb = ((c[0] as u32 * a) / 255) as u8;
+            for yy in y0 as usize..y1 as usize {
+                for xx in x0 as usize..x1 as usize {
+                    let o = (yy * pw as usize + xx) * 4;
+                    if o + 3 < s.pixels.len() {
+                        s.pixels[o] = (pb as u32 + s.pixels[o] as u32 * inv / 255).min(255) as u8;
+                        s.pixels[o+1] = (pg as u32 + s.pixels[o+1] as u32 * inv / 255).min(255) as u8;
+                        s.pixels[o+2] = (pr as u32 + s.pixels[o+2] as u32 * inv / 255).min(255) as u8;
+                        s.pixels[o+3] = (a + s.pixels[o+3] as u32 * inv / 255).min(255) as u8;
                     }
                 }
             }
         }
+        drop(s);
+        let bx0 = corners.iter().map(|(cx, _, _)| ((*cx as f64 * sc) as i64).max(0) as usize).min().unwrap();
+        let by0 = corners.iter().map(|(_, cy, _)| ((*cy as f64 * sc) as i64).max(0) as usize).min().unwrap();
+        let bx1 = corners.iter().map(|(cx, _, _)| (((*cx + 1) as f64 * sc).ceil() as i64).min(pw) as usize).max().unwrap();
+        let by1 = corners.iter().map(|(_, cy, _)| (((*cy + 1) as f64 * sc).ceil() as i64).min(ph) as usize).max().unwrap();
+        self.mark(bx0, by0, bx1, by1);
     }
 
     pub fn clear(&mut self) {
@@ -399,14 +496,6 @@ impl Pen {
 
     fn battery(&mut self) -> i64 {
         crate::sysdata::battery().percent
-    }
-
-    fn dpi_scale(&self) -> f64 {
-        unsafe {
-            use windows::Win32::UI::HiDpi::{GetDpiForSystem};
-            let dpi = GetDpiForSystem();
-            dpi as f64 / 96.0
-        }
     }
 
     fn charging(&mut self) -> bool {
@@ -491,10 +580,16 @@ impl Pen {
     /// Load an image from disk (or wallpaper-relative path), resize to
     /// `(w x h)` and alpha-blend onto the canvas at `(x, y)`.
     fn draw_image_impl(&mut self, x: i64, y: i64, w: i64, h: i64, path: &str) {
+        let sc = { self.inner.lock().unwrap().scale };
+        let pw = (w as f64 * sc).ceil() as usize;
+        let ph = (h as f64 * sc).ceil() as usize;
+        if pw == 0 || ph == 0 {
+            return;
+        }
         let resolved = resolve_widget_path(path);
         if let Some((sw, sh, rgba_data)) = load_image_cached(&resolved) {
-            let resized = resize_rgba(&rgba_data, sw as usize, sh as usize, w as usize, h as usize);
-            blend_rgba_at(self, x, y, w as usize, h as usize, &resized);
+            let resized = resize_rgba(&rgba_data, sw as usize, sh as usize, pw, ph);
+            blend_rgba_at(self, x, y, pw, ph, &resized);
         }
     }
 
@@ -503,9 +598,15 @@ impl Pen {
         if w <= 0 || h <= 0 {
             return;
         }
+        let sc = { self.inner.lock().unwrap().scale };
+        let pw = (w as f64 * sc).ceil() as u32;
+        let ph = (h as f64 * sc).ceil() as u32;
+        if pw == 0 || ph == 0 {
+            return;
+        }
         let resolved = resolve_widget_path(path);
-        if let Some(rgba) = render_svg_cached(&resolved, w as u32, h as u32) {
-            blend_rgba_at(self, x, y, w as usize, h as usize, &rgba);
+        if let Some(rgba) = render_svg_cached(&resolved, pw, ph) {
+            blend_rgba_at(self, x, y, pw as usize, ph as usize, &rgba);
         }
     }
 
@@ -516,9 +617,15 @@ impl Pen {
         if w <= 0 || h <= 0 {
             return;
         }
+        let sc = { self.inner.lock().unwrap().scale };
+        let pw = (w as f64 * sc).ceil() as usize;
+        let ph = (h as f64 * sc).ceil() as usize;
+        if pw == 0 || ph == 0 {
+            return;
+        }
         let resolved = resolve_widget_path(path);
         // Decode at (up to) the requested size so no pixels are wasted.
-        let target = Some((w.min(3840).max(2) as u32, h.min(2160).max(2) as u32));
+        let target = Some((pw.min(3840 * 2).max(2) as u32, ph.min(2160 * 2).max(2) as u32));
         let Some(player) = video_player_for(&resolved, target) else {
             return;
         };
@@ -533,12 +640,67 @@ impl Pen {
         for px in raster.bgra.chunks_exact(4) {
             rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
         }
-        let resized = resize_rgba(&rgba, raster.width, raster.height, w as usize, h as usize);
-        blend_rgba_at(self, x, y, w as usize, h as usize, &resized);
+        let resized = resize_rgba(&rgba, raster.width, raster.height, pw, ph);
+        blend_rgba_at(self, x, y, pw, ph, &resized);
     }
 
     fn gpu_percent(&mut self) -> i64 {
         crate::sysdata::gpu_usage()
+    }
+
+    // -- Regex -----------------------------------------------------------------
+
+    /// Returns true if `text` matches the regex `pattern`.
+    fn regex_match(pattern: &str, text: &str) -> bool {
+        regex::Regex::new(pattern)
+            .ok()
+            .map_or(false, |re| re.is_match(text))
+    }
+
+    /// Returns the first match of `pattern` in `text`, or empty string.
+    fn regex_find(pattern: &str, text: &str) -> String {
+        let Ok(re) = regex::Regex::new(pattern) else {
+            return String::new();
+        };
+        re.captures(text)
+            .and_then(|c| c.get(1).or_else(|| c.get(0)))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Replaces the first (or all) occurrences of `pattern` in `text`.
+    fn regex_replace(pattern: &str, text: &str, replacement: &str, all: bool) -> String {
+        let Ok(re) = regex::Regex::new(pattern) else {
+            return text.to_string();
+        };
+        if all {
+            re.replace_all(text, replacement).into_owned()
+        } else {
+            re.replace(text, replacement).into_owned()
+        }
+    }
+
+    // -- File I/O --------------------------------------------------------------
+
+    /// Read a file to a string. Path is resolved relative to the widget dir.
+    fn read_file(path: &str) -> String {
+        let resolved = resolve_widget_path(path);
+        std::fs::read_to_string(&resolved).unwrap_or_default()
+    }
+
+    /// Write `content` to a file. Creates parent directories if needed.
+    /// Returns true on success.
+    fn write_file(path: &str, content: &str) -> bool {
+        let resolved = resolve_widget_path(path);
+        if let Some(parent) = resolved.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&resolved, content).is_ok()
+    }
+
+    /// Returns true if `path` exists.
+    fn file_exists(path: &str) -> bool {
+        resolve_widget_path(path).exists()
     }
 }
 
@@ -605,6 +767,11 @@ impl WidgetHost {
     /// Every script owns a private surface, so a widget's drawing stays on
     /// screen unchanged while it idles — only the widgets whose code actually
     /// re-runs produce new pixels.
+    ///
+    /// When any widget changes, the dirty region (union of all changed widgets'
+    /// old + new bounding boxes) is cleared **once**, then **all** widgets are
+    /// re-composited into it. This prevents one widget's `clear_buf_region`
+    /// call from erasing another widget's freshly accumulated pixels.
     pub fn render_tick(&mut self) {
         if self.items.is_empty() {
             return;
@@ -624,16 +791,16 @@ impl WidgetHost {
 
         let mut scope = Scope::new();
 
-        for i in due {
-            // Run the script and grab its output while the item borrow is
-            // alive; buffer updates happen after the borrow ends.
+        // --- Pass 1: run all due scripts and collect new frames ---------------
+        let mut new_frames: Vec<Option<(usize, usize, usize, usize, Vec<u8>)>> =
+            vec![None; self.items.len()];
+        let mut changed = Vec::new();
+
+        for &i in &due {
             let frame = {
                 let item = &mut self.items[i];
                 item.last_run = now;
                 item.dirty = false;
-
-                // Fresh surface for this run; the previous frame stays in
-                // the combined buffer until this widget actually redraws.
                 item.pen.clear();
                 let pen = item.pen.clone();
                 if let Err(e) =
@@ -643,22 +810,63 @@ impl WidgetHost {
                 }
                 item.pen.take_frame()
             };
-            let Some((x0, y0, x1, y1, bytes)) = frame else {
-                continue;
-            };
-            let hash = fnv_hash(&bytes);
-            let blank = self.buf_is_blank_at(x0, y0, x1, y1);
-            if hash != self.items[i].hash || blank {
-                let old_bbox = self.items[i].last_bbox;
-                if let Some((bx0, by0, bx1, by1)) = old_bbox {
-                    self.clear_buf_region(bx0, by0, bx1, by1);
+            if let Some((x0, y0, x1, y1, ref bytes)) = frame {
+                let hash = fnv_hash(bytes);
+                if hash != self.items[i].hash {
+                    changed.push(i);
                 }
-                self.accumulate(x0, y0, x1, y1, &bytes);
+                new_frames[i] = Some((x0, y0, x1, y1, bytes.clone()));
+            }
+        }
+
+        if changed.is_empty() {
+            return;
+        }
+
+        // --- Pass 2: compute the union dirty region ---------------------------
+        let mut dirty = (usize::MAX, usize::MAX, 0usize, 0usize);
+        for &i in &changed {
+            // Old bbox (what this widget previously contributed).
+            if let Some((bx0, by0, bx1, by1)) = self.items[i].last_bbox {
+                dirty.0 = dirty.0.min(bx0);
+                dirty.1 = dirty.1.min(by0);
+                dirty.2 = dirty.2.max(bx1);
+                dirty.3 = dirty.3.max(by1);
+            }
+            // New bbox.
+            if let Some((x0, y0, x1, y1, _)) = &new_frames[i] {
+                dirty.0 = dirty.0.min(*x0);
+                dirty.1 = dirty.1.min(*y0);
+                dirty.2 = dirty.2.max(*x1);
+                dirty.3 = dirty.3.max(*y1);
+            }
+        }
+        if dirty.0 >= dirty.2 || dirty.1 >= dirty.3 {
+            return;
+        }
+
+        // --- Pass 3: clear the dirty region once ------------------------------
+        self.clear_buf_region(dirty.0, dirty.1, dirty.2, dirty.3);
+
+        // --- Pass 4: re-accumulate ALL widgets into the dirty region ----------
+        for i in 0..self.items.len() {
+            // Prefer the freshly rendered frame if available; otherwise peek.
+            if let Some((x0, y0, x1, y1, bytes)) = &new_frames[i] {
+                self.accumulate(*x0, *y0, *x1, *y1, bytes);
                 let item = &mut self.items[i];
-                item.hash = hash;
+                item.hash = fnv_hash(bytes);
                 item.dirty = true;
-                item.last_bbox = Some((x0, y0, x1, y1));
+                item.last_bbox = Some((*x0, *y0, *x1, *y1));
                 self.changed = true;
+            } else if let Some((bx0, by0, bx1, by1)) = self.items[i].last_bbox {
+                // Non-due widget with existing output — only re-composite
+                // if its bbox touches the dirty region.
+                if bx0 < dirty.2 && bx1 > dirty.0 && by0 < dirty.3 && by1 > dirty.1 {
+                    if let Some(bytes) = self.items[i].pen.peek_frame(bx0, by0, bx1, by1) {
+                        self.accumulate(bx0, by0, bx1, by1, &bytes);
+                        self.changed = true;
+                    }
+                }
             }
         }
     }
@@ -770,9 +978,13 @@ impl WidgetHost {
         ensure_sample(&dir);
 
         let (cw, ch) = (size.0.max(1) as usize, size.1.max(1) as usize);
-        let sc = dpi_scale();
-        let pw = (cw as f64 * sc).ceil() as usize;
-        let ph = (ch as f64 * sc).ceil() as usize;
+        // `size` is already in physical monitor pixels (the process is
+        // per-monitor DPI aware), so do NOT multiply by dpi_scale here —
+        // an oversized canvas would be downscaled at blit time, destroying
+        // anti-aliasing. Script-facing DPI handling happens exclusively via
+        // `pen_scale`, which normalizes the virtual canvas to this buffer.
+        let pw = cw;
+        let ph = ch;
         let mut host = WidgetHost {
             width: pw,
             height: ph,
@@ -851,6 +1063,8 @@ fn make_engine() -> Engine {
 
     engine.register_fn("clear", |p: &mut Pen| p.clear());
     engine.register_fn("set_opacity", |p: &mut Pen, a: f64| p.set_opacity(a as f32));
+    engine.register_fn("state", |p: &mut Pen, key: &str| -> rhai::Dynamic { p.state(key) });
+    engine.register_fn("set_state", |p: &mut Pen, key: &str, val: rhai::Dynamic| { p.set_state(key, val); });
     engine.register_fn("width", |p: &mut Pen| p.dims().0 as i64);
     engine.register_fn("height", |p: &mut Pen| p.dims().1 as i64);
 
@@ -912,7 +1126,6 @@ fn make_engine() -> Engine {
     // Battery
     engine.register_fn("battery", |p: &mut Pen| p.battery());
     engine.register_fn("charging", |p: &mut Pen| p.charging());
-    engine.register_fn("dpi_scale", |p: &Pen| p.dpi_scale());
 
     // Bluetooth devices
     engine.register_fn("bt_count", |p: &mut Pen| p.bt_count());
@@ -953,11 +1166,124 @@ fn make_engine() -> Engine {
 
     // GPU utilisation
     engine.register_fn("gpu", |p: &mut Pen| p.gpu_percent());
+
+    // Regex
+    engine.register_fn("regex_match", |pattern: &str, text: &str| Pen::regex_match(pattern, text));
+    engine.register_fn("regex_find", |pattern: &str, text: &str| Pen::regex_find(pattern, text));
+    engine.register_fn("regex_replace", |pattern: &str, text: &str, repl: &str| Pen::regex_replace(pattern, text, repl, false));
+    engine.register_fn("regex_replace_all", |pattern: &str, text: &str, repl: &str| Pen::regex_replace(pattern, text, repl, true));
+    engine.register_fn("regex_find_all", |pattern: &str, text: &str| {
+        let matches: rhai::Array = regex::Regex::new(pattern)
+            .ok()
+            .map(|re| {
+                re.find_iter(text)
+                    .map(|m| rhai::Dynamic::from(m.as_str().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        matches
+    });
+
+    // File I/O
+    engine.register_fn("read_file", |path: &str| Pen::read_file(path));
+    engine.register_fn("write_file", |path: &str, content: &str| Pen::write_file(path, content));
+    engine.register_fn("file_exists", |path: &str| Pen::file_exists(path));
+
+    // JSON
+    engine.register_fn("json_parse", |text: &str| -> rhai::Dynamic {
+        match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(v) => json_to_dynamic(&v),
+            Err(_) => rhai::Dynamic::UNIT,
+        }
+    });
+    engine.register_fn("json_stringify", |val: rhai::Dynamic| -> String {
+        match dynamic_to_json(&val) {
+            Ok(v) => v,
+            Err(_) => "null".to_string(),
+        }
+    });
+    engine.register_fn("json_get", |val: rhai::Dynamic, key: &str| -> rhai::Dynamic {
+        if let Some(map) = val.clone().try_cast::<rhai::Map>() {
+            map.get(key).cloned().unwrap_or(rhai::Dynamic::UNIT)
+        } else if let Some(arr) = val.try_cast::<rhai::Array>() {
+            if let Ok(idx) = key.parse::<usize>() {
+                arr.get(idx).cloned().unwrap_or(rhai::Dynamic::UNIT)
+            } else {
+                rhai::Dynamic::UNIT
+            }
+        } else {
+            rhai::Dynamic::UNIT
+        }
+    });
+
     engine
 }
 
 // ---------------------------------------------------------------------------
-// Text rendering (GDI scratch bitmap -> coverage mask -> tinted blend)
+// JSON ↔ Rhai conversion helpers
+// ---------------------------------------------------------------------------
+
+fn json_to_dynamic(val: &serde_json::Value) -> rhai::Dynamic {
+    use serde_json::Value;
+    match val {
+        Value::Null => rhai::Dynamic::UNIT,
+        Value::Bool(b) => rhai::Dynamic::from(*b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                rhai::Dynamic::from(i)
+            } else if let Some(f) = n.as_f64() {
+                rhai::Dynamic::from(f)
+            } else {
+                rhai::Dynamic::UNIT
+            }
+        }
+        Value::String(s) => rhai::Dynamic::from(s.clone()),
+        Value::Array(arr) => {
+            let v: rhai::Array = arr.iter().map(json_to_dynamic).collect();
+            rhai::Dynamic::from_array(v)
+        }
+        Value::Object(map) => {
+            let mut m = rhai::Map::new();
+            for (k, v) in map {
+                m.insert(k.clone().into(), json_to_dynamic(v));
+            }
+            rhai::Dynamic::from_map(m)
+        }
+    }
+}
+
+fn dynamic_to_json(val: &rhai::Dynamic) -> Result<String, ()> {
+    let v = dynamic_to_serde(val)?;
+    serde_json::to_string(&v).map_err(|_| ())
+}
+
+fn dynamic_to_serde(val: &rhai::Dynamic) -> Result<serde_json::Value, ()> {
+    if val.is::<()>() {
+        Ok(serde_json::Value::Null)
+    } else if val.is::<bool>() {
+        Ok(serde_json::Value::Bool(val.clone().cast::<bool>()))
+    } else if val.is::<i64>() {
+        Ok(serde_json::json!(val.clone().cast::<i64>()))
+    } else if val.is::<f64>() {
+        Ok(serde_json::json!(val.clone().cast::<f64>()))
+    } else if val.is::<String>() {
+        Ok(serde_json::Value::String(val.clone().cast::<String>()))
+    } else if val.is::<rhai::Array>() {
+        let arr = val.clone().cast::<rhai::Array>();
+        let v: Result<Vec<serde_json::Value>, ()> =
+            arr.iter().map(dynamic_to_serde).collect();
+        Ok(serde_json::Value::Array(v?))
+    } else if val.is::<rhai::Map>() {
+        let map = val.clone().cast::<rhai::Map>();
+        let m: Result<serde_json::Map<String, serde_json::Value>, ()> = map
+            .iter()
+            .map(|(k, v)| Ok((k.to_string(), dynamic_to_serde(v)?)))
+            .collect();
+        Ok(serde_json::Value::Object(m?))
+    } else {
+        Ok(serde_json::Value::String(format!("{val}")))
+    }
+}
 // ---------------------------------------------------------------------------
 
 /// Cache of loaded custom fonts: maps canonical path → (family name, resource ID).
@@ -1025,6 +1351,10 @@ fn resolve_font(font: &str) -> String {
     family
 }
 
+// ---------------------------------------------------------------------------
+// Text rendering (GDI scratch bitmap -> coverage mask -> tinted blend)
+// ---------------------------------------------------------------------------
+
 fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8; 4], font: &str, spacing: i64) {
     let (w, h) = pen.dims();
     if w == 0 || h == 0 || text.is_empty() {
@@ -1061,7 +1391,7 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
 
         // Create font first so we can measure text width.
         let wide_font: Vec<u16> = family.encode_utf16().chain(std::iter::once(0)).collect();
-        let hf = CreateFontW(-spx, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 2, 0, windows::core::PCWSTR(wide_font.as_ptr()));
+        let hf = CreateFontW(-spx, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 4, 0, windows::core::PCWSTR(wide_font.as_ptr()));
         let old_font = SelectObject(mem, hf);
 
         // Measure actual text width at supersampled size.
@@ -1120,6 +1450,8 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
         // Downsample the supersampled coverage mask by averaging S×S blocks.
         let stride = est_w as usize * 4;
         let data = std::slice::from_raw_parts(bits.cast::<u8>(), stride * est_h as usize);
+        // Collect all non-zero pixels first, then blend in a single lock.
+        let mut pixels: Vec<(usize, usize, u8)> = Vec::new();
         for gy in 0..est_h as usize / S {
             let dy = phys_y as usize + gy;
             if dy >= ph {
@@ -1143,16 +1475,25 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
                     continue;
                 }
                 let a = (cov * c[3] as u32) / 255;
-                pen.blend_px(
-                    dx,
-                    dy,
-                    [
-                        ((c[2] as u32 * a) / 255) as u8,
-                        ((c[1] as u32 * a) / 255) as u8,
-                        ((c[0] as u32 * a) / 255) as u8,
-                        a as u8,
-                    ],
-                );
+                pixels.push((dx, dy, a as u8));
+            }
+        }
+        if !pixels.is_empty() {
+            let mut s = pen.inner.lock().unwrap();
+            let opa = s.opacity;
+            for (dx, dy, a) in &pixels {
+                let a = if opa < 1.0 { (*a as f32 * opa) as u8 } else { *a };
+                if a == 0 { continue; }
+                let o = (*dy * pw + *dx) * 4;
+                if o + 3 >= s.pixels.len() { continue; }
+                let inv = 255 - a as u32;
+                let pr = ((c[0] as u32 * a as u32) / 255) as u8;
+                let pg = ((c[1] as u32 * a as u32) / 255) as u8;
+                let pb = ((c[2] as u32 * a as u32) / 255) as u8;
+                s.pixels[o] = (pb as u32 + s.pixels[o] as u32 * inv / 255).min(255) as u8;
+                s.pixels[o + 1] = (pg as u32 + s.pixels[o + 1] as u32 * inv / 255).min(255) as u8;
+                s.pixels[o + 2] = (pr as u32 + s.pixels[o + 2] as u32 * inv / 255).min(255) as u8;
+                s.pixels[o + 3] = (a as u32 + s.pixels[o + 3] as u32 * inv / 255).min(255) as u8;
             }
         }
 

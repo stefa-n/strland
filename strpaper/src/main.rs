@@ -444,13 +444,17 @@ impl App {
 
     /// The size videos should be decoded into — the desktop's bounding box, so
     /// we never convert or blit more pixels than are actually shown.
-    fn target_size(&self) -> Option<(u32, u32)> {        if self.monitors.is_empty() {
+    fn target_size(&self) -> Option<(u32, u32)> {
+        if self.monitors.is_empty() {
             return None;
         }
+        // Monitor bounds are already in physical pixels (the process is
+        // per-monitor DPI aware), so no extra DPI multiplication here —
+        // an oversized canvas gets downscaled at blit time, which destroys
+        // anti-aliasing.
         let (_x, _y, w, h) = desktop::bounds(&self.monitors);
         if w > 0 && h > 0 {
-            let sc = widgets::dpi_scale();
-            Some(((w as f64 * sc).ceil() as u32, (h as f64 * sc).ceil() as u32))
+            Some((w as u32, h as u32))
         } else {
             None
         }

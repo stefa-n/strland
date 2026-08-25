@@ -82,13 +82,18 @@ fn draw(pen) {
 
 | Category | Methods |
 |----------|---------|
-| Drawing | `clear`, `fill_rect`, `fill_round_rect`, `fill_circle`, `circle`, `arc`, `line`, `text` |
-| System | `battery`, `charging`, `bt_count`, `bt_level(i)`, `bt_name(i)`, `cpu`, `ram` |
-| Audio | `audio_level(pos)`, `media_playing` |
+| Drawing | `clear`, `fill_rect`, `fill_round_rect`, `fill_circle`, `circle`, `arc`, `line`, `text(x, y, str, px, color)`, `text(x, y, str, px, color, font)`, `text(x, y, str, px, color, font, spacing)` |
+| Compositing | `set_opacity(a)` |
+| System | `battery`, `charging`, `bt_count`, `bt_level(i)`, `bt_name(i)`, `cpu`, `ram`, `gpu` |
+| Audio / Media | `audio_level(pos)`, `media_playing`, `media_title`, `media_artist` |
 | Network | `http_get(url)`, `http_download(url, path)` |
 | Process | `run(cmd)` |
-| Images | `image(x, y, w, h, path)` |
-| Time | `time(fmt)`, `width`, `height` |
+| Images / Media | `image(x, y, w, h, path)`, `svg(x, y, w, h, path)`, `video(x, y, w, h, path)` |
+| Time | `time(fmt)`, `date(fmt)` |
+| Canvas | `width`, `height` |
+| Regex | `regex_match(pattern, text)`, `regex_find(pattern, text)`, `regex_replace(pattern, text, repl)`, `regex_replace_all(pattern, text, repl)`, `regex_find_all(pattern, text)` |
+| JSON | `json_parse(text)`, `json_stringify(val)`, `json_get(val, key)` |
+| File I/O | `read_file(path)`, `write_file(path, content)`, `file_exists(path)` |
 
 Colours: `"#RGB"`, `"#RRGGBB"`, `"#RRGGBBAA"` (alpha composites over the
 wallpaper).
