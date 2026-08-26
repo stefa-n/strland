@@ -1089,10 +1089,9 @@ impl eframe::App for DynamicIslandApp {
             || self.themes.open
             || self.switcher.active
             || self.switcher.anim > 0.001;
-        if self.hidden && !self.y_animating && !any_overlay {
-            return;
-        }
+        let skip_drawing = self.hidden && !self.y_animating && !any_overlay;
 
+        if !skip_drawing {
         // --- Drawing ---
         let viewport_rect = ctx.screen_rect();
         let pill_rect = egui::Rect::from_center_size(
@@ -1620,6 +1619,7 @@ impl eframe::App for DynamicIslandApp {
                 self.switcher.activate_selected();
             }
         }
+        } // end if !skip_drawing
 
         // --- Repaint scheduling ---
         let launcher_animating = self.launcher.anim > 0.001 && self.launcher.anim < 0.999;
