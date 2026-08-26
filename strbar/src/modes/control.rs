@@ -46,11 +46,35 @@ pub struct ControlCenterState {
     pub dnd: bool,
     pub night_light: bool,
     pub submenu: ControlSubmenu,
+    pub cached_wifi_on: bool,
+    pub cached_wifi_name: String,
+    pub cached_bt_on: bool,
+    pub cached_bt_name: String,
+    pub cached_audio_name: String,
+    pub cached_muted: bool,
+    pub cached_audio_devices: Vec<(String, String)>,
+    pub cached_wifi_networks: Vec<String>,
+    pub cached_bt_devices: Vec<(String, bool)>,
+    pub last_poll: std::time::Instant,
 }
 
 impl Default for ControlCenterState {
     fn default() -> Self {
-        Self { dnd: false, night_light: false, submenu: ControlSubmenu::None }
+        Self {
+            dnd: false,
+            night_light: false,
+            submenu: ControlSubmenu::None,
+            cached_wifi_on: false,
+            cached_wifi_name: String::new(),
+            cached_bt_on: false,
+            cached_bt_name: String::new(),
+            cached_audio_name: String::new(),
+            cached_muted: false,
+            cached_audio_devices: Vec::new(),
+            cached_wifi_networks: Vec::new(),
+            cached_bt_devices: Vec::new(),
+            last_poll: std::time::Instant::now(),
+        }
     }
 }
 
@@ -157,7 +181,7 @@ fn slider_row(
     id: &'static str,
     on_change: impl FnOnce(f32),
     item_bg: egui::Color32,
-) {
+) -> bool {
     let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height));
     ui.painter().rect_filled(rect, egui::CornerRadius::same((height / 2.0) as u8), item_bg);
 
@@ -193,10 +217,12 @@ fn slider_row(
     }
 
     let response = ui.interact(rect, ui.make_persistent_id(("cslider", id)), egui::Sense::drag());
+    let dragging = response.interact_pointer_pos().is_some();
     if let Some(pos) = response.interact_pointer_pos() {
         let frac = ((pos.x - slider_x) / slider_w).clamp(0.0, 1.0);
         on_change(frac);
     }
+    dragging
 }
 
 /// Draws a submenu as a column of simple list rows.
@@ -265,14 +291,11 @@ pub fn draw_control_center(
     icons: &ControlCenterIcons,
     media: Option<(&egui::TextureHandle, &str, &str)>,
     volume: f32,
+    bg: egui::Color32,
+    item_bg: egui::Color32,
 ) -> Vec<ControlAction> {
     let mut actions: Vec<ControlAction> = Vec::new();
-    let bg = Config::parse_color(&cfg.background);
-    let bg = egui::Color32::from_rgb(bg.r(), bg.g(), bg.b());
     ui.painter().rect_filled(rect, egui::CornerRadius::same(30), bg);
-
-    let item_bg = Config::parse_color(&cfg.status_button_background);
-    let item_bg = egui::Color32::from_rgb(item_bg.r(), item_bg.g(), item_bg.b());
 
     let pad = 16.0;
     let gap = 10.0;
@@ -292,10 +315,22 @@ pub fn draw_control_center(
     ];
 
     let status = win::system_status();
-    let wifi_on = win::wifi_radio_is_on();
-    let wifi_name = win::current_wifi_ssid();
+
+    // Poll expensive COM/WinRT queries at most every 500ms.
+    let now = std::time::Instant::now();
+    if now.duration_since(state.last_poll).as_millis() >= 500 {
+        state.cached_wifi_on = win::wifi_radio_is_on();
+        state.cached_wifi_name = win::current_wifi_ssid();
+        state.cached_bt_on = win::bluetooth_radio_is_on();
+        state.cached_bt_name = win::current_bluetooth_name();
+        state.cached_audio_name = win::default_audio_output_name();
+        state.cached_muted = win::get_mute();
+        state.last_poll = now;
+    }
+
+    let wifi_on = state.cached_wifi_on;
     let wifi_sub = if status.wifi_connected {
-        if wifi_name.is_empty() { "Connected".to_string() } else { wifi_name }
+        if state.cached_wifi_name.is_empty() { "Connected".to_string() } else { state.cached_wifi_name.clone() }
     } else if wifi_on {
         "Not connected".to_string()
     } else {
@@ -309,9 +344,8 @@ pub fn draw_control_center(
         TileZone::None => {}
     }
 
-    let audio_name = win::default_audio_output_name();
-    let audio_sub = if audio_name.is_empty() { "System output".to_string() } else { audio_name };
-    let muted = win::get_mute();
+    let audio_sub = if state.cached_audio_name.is_empty() { "System output".to_string() } else { state.cached_audio_name.clone() };
+    let muted = state.cached_muted;
     let audio_icon = if muted { &icons.audio_muted } else { &icons.audio };
     let zone = tile(ui, row1[1], "Audio", &audio_sub, Some(audio_icon), accent, 1.0, !muted, item_bg, bg);
     match zone {
@@ -320,10 +354,9 @@ pub fn draw_control_center(
         TileZone::None => {}
     }
 
-    let bt_on = win::bluetooth_radio_is_on();
-    let bt_name = win::current_bluetooth_name();
+    let bt_on = state.cached_bt_on;
     let bt_sub = if status.bluetooth_connected {
-        if bt_name.is_empty() { "On".to_string() } else { bt_name }
+        if state.cached_bt_name.is_empty() { "On".to_string() } else { state.cached_bt_name.clone() }
     } else if bt_on {
         "Not connected".to_string()
     } else {
@@ -403,8 +436,10 @@ pub fn draw_control_center(
     let y3 = y_pills + pill_h + gap;
     let slider_h = 40.0;
     let mut vol = volume;
-    slider_row(ui, y3, rect.left() + pad, content_w, slider_h, Some(&icons.audio), accent, vol, "volume", |v| vol = v, item_bg);
-    win::set_volume(vol);
+    let slider_response = slider_row(ui, y3, rect.left() + pad, content_w, slider_h, Some(&icons.audio), accent, vol, "volume", |v| vol = v, item_bg);
+    if slider_response {
+        win::set_volume(vol);
+    }
 
     // Submenu area (appears when a tile's text is tapped).
     if state.submenu != ControlSubmenu::None {
@@ -415,33 +450,46 @@ pub fn draw_control_center(
         );
         match state.submenu {
             ControlSubmenu::Audio => {
-                let devices: Vec<(String, bool)> = win::list_audio_outputs()
-                    .iter()
-                    .map(|d| (d.name.clone(), false))
-                    .collect();
+                if state.cached_audio_devices.is_empty() {
+                    state.cached_audio_devices = win::list_audio_outputs()
+                        .iter()
+                        .map(|d| (d.name.clone(), d.id.clone()))
+                        .collect();
+                }
+                let devices: Vec<(String, bool)> = state.cached_audio_devices.iter().map(|(n, _)| (n.clone(), false)).collect();
                 if let Some(i) = submenu(ui, sub_rect, accent, "Audio output", devices, item_bg) {
-                    if let Some(dev) = win::list_audio_outputs().get(i) {
-                        actions.push(ControlAction::SetDefaultAudio(dev.id.clone()));
+                    if let Some((_, id)) = state.cached_audio_devices.get(i) {
+                        actions.push(ControlAction::SetDefaultAudio(id.clone()));
                     }
+                    state.cached_audio_devices.clear();
                 }
             }
             ControlSubmenu::Wifi => {
-                let nets: Vec<(String, bool)> = win::list_wifi_networks()
-                    .iter()
-                    .map(|n| (n.ssid.clone(), false))
-                    .collect();
+                if state.cached_wifi_networks.is_empty() {
+                    state.cached_wifi_networks = win::list_wifi_networks()
+                        .iter()
+                        .map(|n| n.ssid.clone())
+                        .collect();
+                }
+                let nets: Vec<(String, bool)> = state.cached_wifi_networks.iter().map(|n| (n.clone(), false)).collect();
                 if let Some(i) = submenu(ui, sub_rect, accent, "Wi-Fi networks", nets, item_bg) {
-                    if let Some(net) = win::list_wifi_networks().get(i) {
-                        actions.push(ControlAction::ConnectWifi(net.ssid.clone()));
+                    if let Some(ssid) = state.cached_wifi_networks.get(i) {
+                        actions.push(ControlAction::ConnectWifi(ssid.clone()));
                     }
+                    state.cached_wifi_networks.clear();
                 }
             }
             ControlSubmenu::Bluetooth => {
-                let devs: Vec<(String, bool)> = win::list_bluetooth_devices()
-                    .iter()
-                    .map(|(n, c)| (n.clone(), *c))
-                    .collect();
-                let _ = submenu(ui, sub_rect, accent, "Bluetooth devices", devs, item_bg);
+                if state.cached_bt_devices.is_empty() {
+                    state.cached_bt_devices = win::list_bluetooth_devices()
+                        .iter()
+                        .map(|(n, c)| (n.clone(), *c))
+                        .collect();
+                }
+                let devs: Vec<(String, bool)> = state.cached_bt_devices.iter().map(|(n, c)| (n.clone(), *c)).collect();
+                if submenu(ui, sub_rect, accent, "Bluetooth devices", devs, item_bg).is_some() {
+                    state.cached_bt_devices.clear();
+                }
             }
             ControlSubmenu::Power | ControlSubmenu::None => {}
         }
@@ -521,42 +569,57 @@ fn corner_mask(
     bg: egui::Color32,
     steps: usize,
 ) {
-    let mut pts = Vec::with_capacity(steps + 2);
-    pts.push(corner);
-    for i in 0..=steps {
+    let mut pts = [egui::Pos2::ZERO; 12];
+    let count = (steps + 2).min(pts.len());
+    pts[0] = corner;
+    for i in 0..=steps.min(count - 2) {
         let t = std::f32::consts::FRAC_PI_2 * (i as f32 / steps as f32);
-        pts.push(corner + egui::vec2(dx * r * t.cos(), dy * r * t.sin()));
+        pts[i + 1] = corner + egui::vec2(dx * r * t.cos(), dy * r * t.sin());
     }
-    pts.push(corner);
+    pts[count - 1] = corner;
     painter.add(egui::epaint::PathShape::convex_polygon(
-        pts, bg, egui::Stroke::NONE,
+        pts[..count].to_vec(), bg, egui::Stroke::NONE,
     ));
 }
 
 /// Truncates `text` with an ellipsis so its rendered width fits `max_w`.
+/// Uses a thread-local cache to avoid repeated binary searches for the same input.
 fn truncate_to_fit(painter: &egui::Painter, text: &str, font: &egui::FontId, max_w: f32) -> String {
-    if max_w <= 0.0 {
-        return String::new();
+    use std::collections::HashMap;
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<HashMap<(String, u32), String>> = RefCell::new(HashMap::new());
     }
-    let measure = |s: &str| painter.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
-    if measure(text) <= max_w {
-        return text.to_string();
+    let key = (text.to_string(), max_w.to_bits());
+    if let Some(cached) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return cached;
     }
-    let ellipsis_w = measure("…");
-    let mut lo = 0usize;
-    let mut hi = text.chars().count();
-    let mut best = 0usize;
-    while lo < hi {
-        let mid = (lo + hi + 1) / 2;
-        let prefix: String = text.chars().take(mid).collect();
-        if measure(&prefix) + ellipsis_w <= max_w {
-            best = mid;
-            lo = mid;
+    let result = if max_w <= 0.0 {
+        String::new()
+    } else {
+        let measure = |s: &str| painter.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
+        if measure(text) <= max_w {
+            text.to_string()
         } else {
-            hi = mid - 1;
+            let ellipsis_w = measure("…");
+            let mut lo = 0usize;
+            let mut hi = text.chars().count();
+            let mut best = 0usize;
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2;
+                let prefix: String = text.chars().take(mid).collect();
+                if measure(&prefix) + ellipsis_w <= max_w {
+                    best = mid;
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            let mut out: String = text.chars().take(best).collect();
+            out.push('…');
+            out
         }
-    }
-    let mut out: String = text.chars().take(best).collect();
-    out.push('…');
-    out
+    };
+    CACHE.with(|c| c.borrow_mut().insert(key, result.clone()));
+    result
 }

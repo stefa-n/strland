@@ -26,6 +26,8 @@ pub struct LauncherState {
     icon_cache: HashMap<String, Option<egui::TextureHandle>>,
     selected: usize,
     selection_query: String,
+    cached_filtered: Vec<usize>,
+    cached_query: String,
 }
 
 impl LauncherState {
@@ -42,6 +44,8 @@ impl LauncherState {
             icon_cache: HashMap::new(),
             selected: 0,
             selection_query: String::new(),
+            cached_filtered: Vec::new(),
+            cached_query: String::new(),
         }
     }
 
@@ -94,25 +98,25 @@ impl LauncherState {
         }
 
         self.ensure_loaded();
-
-        let matches = self.filtered_matches();
+        self.update_filtered_matches();
 
         // Keyboard selection resets whenever the query changes.
         if self.query != self.selection_query {
             self.selected = 0;
             self.selection_query = self.query.clone();
         }
-        if self.selected >= matches.len() {
-            self.selected = matches.len().saturating_sub(1);
+        if self.selected >= self.cached_filtered.len() {
+            self.selected = self.cached_filtered.len().saturating_sub(1);
         }
 
         // Row visibility is driven by the CURRENT filtered matches, so a search
         // immediately replaces the list — old rows fade out instead of lingering.
         let visible_ids: HashSet<String> =
-            matches.iter().map(|entry| entry.id.clone()).take(cfg.launcher_results).collect();
+            self.cached_filtered.iter().map(|&i| self.apps[i].id.clone()).take(cfg.launcher_results).collect();
 
         if self.open {
-            for (rank, entry) in matches.iter().enumerate().take(cfg.launcher_results) {
+            for (rank, &idx) in self.cached_filtered.iter().enumerate().take(cfg.launcher_results) {
+                let entry = &self.apps[idx];
                 self.row_rank.insert(entry.id.clone(), rank);
                 let current = *self.row_anim.get(&entry.id).unwrap_or(&0.0);
                 self.row_anim.insert(entry.id.clone(), approach(current, 1.0, dt, cfg.launcher_anim_speed));
@@ -139,7 +143,8 @@ impl LauncherState {
 
         // Extract at most one real app icon per frame to keep things smooth.
         if self.open {
-            for entry in matches.iter().take(cfg.launcher_results) {
+            for &idx in self.cached_filtered.iter().take(cfg.launcher_results) {
+                let entry = &self.apps[idx];
                 if !self.icon_cache.contains_key(&entry.id) {
                     let tex = load_icon_texture(ctx, &entry.id, &entry.target);
                     self.icon_cache.insert(entry.id.clone(), tex);
@@ -241,10 +246,10 @@ impl LauncherState {
 
             // Keyboard navigation.
             if self.open {
-                if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !matches.is_empty() {
-                    self.selected = (self.selected + 1).min(matches.len() - 1);
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !self.cached_filtered.is_empty() {
+                    self.selected = (self.selected + 1).min(self.cached_filtered.len() - 1);
                 }
-                if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) && !matches.is_empty() {
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) && !self.cached_filtered.is_empty() {
                     self.selected = self.selected.saturating_sub(1);
                 }
             }
@@ -370,8 +375,8 @@ impl LauncherState {
                     self.close();
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if let Some(entry) = matches.get(self.selected) {
-                        launch_target = Some(entry.target.clone());
+                    if let Some(&idx) = self.cached_filtered.get(self.selected) {
+                        launch_target = Some(self.apps[idx].target.clone());
                     }
                 }
             }
@@ -383,16 +388,21 @@ impl LauncherState {
         });
     }
 
-    fn filtered_matches(&self) -> Vec<AppEntry> {
+    fn update_filtered_matches(&mut self) {
         let query = self.query.trim().to_ascii_lowercase();
-        let mut entries: Vec<_> = self
+        if query == self.cached_query && !self.cached_filtered.is_empty() {
+            return;
+        }
+        self.cached_query = query.clone();
+        let mut scored: Vec<(usize, i32)> = self
             .apps
             .iter()
-            .map(|entry| (entry, score_entry(entry, &query)))
+            .enumerate()
+            .map(|(i, entry)| (i, score_entry(entry, &query)))
             .filter(|(_, score)| *score >= 0)
             .collect();
-        entries.sort_by(|(a, score_a), (b, score_b)| score_b.cmp(score_a).then_with(|| a.name.cmp(&b.name)));
-        entries.into_iter().map(|(entry, _)| entry.clone()).collect()
+        scored.sort_by(|(a, score_a), (b, score_b)| score_b.cmp(score_a).then_with(|| self.apps[*a].name.cmp(&self.apps[*b].name)));
+        self.cached_filtered = scored.into_iter().map(|(i, _)| i).collect();
     }
 }
 

@@ -48,17 +48,6 @@ pub fn widgets_dir(wallpaper_dir: &std::path::Path) -> std::path::PathBuf {
     dir
 }
 
-/// Returns the system DPI scale factor (1.0 = 96 DPI, 1.25 = 120 DPI, etc.).
-pub(crate) fn dpi_scale() -> f64 {
-    static CACHE: OnceLock<f64> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        unsafe {
-            use windows::Win32::UI::HiDpi::GetDpiForSystem;
-            GetDpiForSystem() as f64 / 96.0
-        }
-    })
-}
-
 /// Write an example widget so the feature is discoverable.
 pub fn ensure_sample(dir: &std::path::Path) {
     let sample = dir.join("clock.rhai");
@@ -761,6 +750,11 @@ impl WidgetHost {
         self.changed
     }
 
+    /// Clear the dirty flag after the composited frame has been painted.
+    pub fn reset_changed(&mut self) {
+        self.changed = false;
+    }
+
     /// Run each script when its own throttle interval elapses (scripts can
     /// pick their rate with an optional `fn fps()`; default [`WIDGET_FPS`]).
     ///
@@ -1355,6 +1349,28 @@ fn resolve_font(font: &str) -> String {
 // Text rendering (GDI scratch bitmap -> coverage mask -> tinted blend)
 // ---------------------------------------------------------------------------
 
+/// Thread-local scratch DC kept alive across text() calls to avoid
+/// CreateCompatibleDC / DeleteDC churn.
+fn text_mem_dc() -> windows::Win32::Graphics::Gdi::HDC {
+    use std::cell::Cell;
+    thread_local! {
+        static DC: Cell<isize> = const { Cell::new(0) };
+    }
+    DC.with(|cell| {
+        let raw = cell.get();
+        if raw != 0 {
+            return windows::Win32::Graphics::Gdi::HDC(raw as *mut core::ffi::c_void);
+        }
+        unsafe {
+            let screen_dc = windows::Win32::Graphics::Gdi::GetDC(None);
+            let mem = windows::Win32::Graphics::Gdi::CreateCompatibleDC(screen_dc);
+            let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, screen_dc);
+            cell.set(mem.0 as isize);
+            mem
+        }
+    })
+}
+
 fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8; 4], font: &str, spacing: i64) {
     let (w, h) = pen.dims();
     if w == 0 || h == 0 || text.is_empty() {
@@ -1377,14 +1393,12 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
         use windows::Win32::Foundation::COLORREF;
         use windows::Win32::Foundation::SIZE;
         use windows::Win32::Graphics::Gdi::{
-            CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GetDC,
-            GetTextExtentPoint32W, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TextOutW,
+            CreateDIBSection, CreateFontW, DeleteObject,
+            GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor, TextOutW,
             BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, TRANSPARENT,
         };
 
-        let screen_dc = GetDC(None);
-        let mem = CreateCompatibleDC(screen_dc);
-        let _ = ReleaseDC(None, screen_dc);
+        let mem = text_mem_dc();
 
         let s = S as i32;
         let spx = px * s;
@@ -1424,7 +1438,9 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
         let bmp = match CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
             Ok(b) => b,
             Err(_) => {
-                let _ = DeleteDC(mem);
+                // DC is reused; just clean up the font.
+                SelectObject(mem, old_font);
+                let _ = DeleteObject(hf);
                 return;
             }
         };
@@ -1501,7 +1517,7 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
         let _ = DeleteObject(hf);
         SelectObject(mem, old_bmp);
         let _ = DeleteObject(bmp);
-        let _ = DeleteDC(mem);
+        // DC is kept alive in the thread-local for reuse.
     }
 }
 
@@ -1556,6 +1572,13 @@ fn video_player_for(
 
 type SvgCache = HashMap<(PathBuf, u32, u32), Arc<Vec<u8>>>;
 
+/// Maximum number of SVG entries kept in the cache. When the limit is hit
+/// the entire cache is cleared (simple and prevents unbounded growth).
+const SVG_CACHE_MAX: usize = 128;
+
+/// Maximum number of decoded image entries kept in the cache.
+const IMAGE_CACHE_MAX: usize = 64;
+
 /// Render an SVG to straight RGBA at an exact size, cached per path+size.
 fn render_svg_cached(path: &Path, tw: u32, th: u32) -> Option<Arc<Vec<u8>>> {
     {
@@ -1568,6 +1591,9 @@ fn render_svg_cached(path: &Path, tw: u32, th: u32) -> Option<Arc<Vec<u8>>> {
     let rgba = render_svg(&data, tw, th)?;
     let arc = Arc::new(rgba);
     if let Ok(mut cache) = svg_cache().lock() {
+        if cache.len() >= SVG_CACHE_MAX {
+            cache.clear();
+        }
         cache.insert((path.to_path_buf(), tw, th), arc.clone());
     }
     Some(arc)
@@ -1732,10 +1758,13 @@ fn load_image_cached(resolved: &Path) -> Option<(u32, u32, Arc<Vec<u8>>)> {
     let rgba = img.to_rgba8();
     let (w, h) = (img.width(), img.height());
     let data = Arc::new(rgba.into_raw());
-    image_cache()
-        .lock()
-        .unwrap()
-        .insert(resolved.to_string_lossy().to_string(), (w, h, data.clone()));
+    {
+        let mut cache = image_cache().lock().unwrap();
+        if cache.len() >= IMAGE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(resolved.to_string_lossy().to_string(), (w, h, data.clone()));
+    }
     Some((w, h, data))
 }
 

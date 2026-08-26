@@ -165,6 +165,14 @@ struct DynamicIslandApp {
     last_modified: SystemTime,
     viewport_size: egui::Vec2,
 
+    cached_accent: egui::Color32,
+    cached_background: egui::Color32,
+    cached_launcher_highlight: egui::Color32,
+    cached_launcher_background: egui::Color32,
+    cached_status_button_bg: egui::Color32,
+    cached_media_title: String,
+    cached_media_artist: String,
+
     clock: String,
     day: String,
     mode: IslandMode,
@@ -259,10 +267,17 @@ impl DynamicIslandApp {
         let start_height = cfg.height;
 
         Self {
-            cfg,
+            cfg: cfg.clone(),
             hwnd,
             last_modified: config_file_mtime(),
             viewport_size,
+            cached_accent: Config::parse_color(&cfg.accent_color),
+            cached_background: Config::parse_color(&cfg.background),
+            cached_launcher_highlight: Config::parse_color(&cfg.launcher_highlight),
+            cached_launcher_background: Config::parse_color(&cfg.launcher_background),
+            cached_status_button_bg: Config::parse_color(&cfg.status_button_background),
+            cached_media_title: String::new(),
+            cached_media_artist: String::new(),
             clock,
             day,
             mode: IslandMode::Clock,
@@ -383,6 +398,11 @@ impl DynamicIslandApp {
         }
         self.cfg = new_cfg;
         self.last_modified = config_file_mtime();
+        self.cached_accent = Config::parse_color(&self.cfg.accent_color);
+        self.cached_background = Config::parse_color(&self.cfg.background);
+        self.cached_launcher_highlight = Config::parse_color(&self.cfg.launcher_highlight);
+        self.cached_launcher_background = Config::parse_color(&self.cfg.launcher_background);
+        self.cached_status_button_bg = Config::parse_color(&self.cfg.status_button_background);
         self.sync_viewport_size(ctx);
 
         if let Some(hwnd) = self.hwnd {
@@ -624,6 +644,12 @@ impl DynamicIslandApp {
             );
             self.media_tex =
                 Some(ctx.load_texture("media-art", image, egui::TextureOptions::LINEAR));
+        }
+
+        // Cache media text to avoid cloning from mutex every frame.
+        if let Some(m) = win::media_text() {
+            self.cached_media_title = m.title;
+            self.cached_media_artist = m.artist;
         }
     }
 }
@@ -1054,6 +1080,19 @@ impl eframe::App for DynamicIslandApp {
         self.ensure_ui_assets(ctx);
         self.sync_viewport_size(ctx);
 
+        // Skip all rendering when the pill is fully hidden off-screen and no
+        // overlay panels are open. This eliminates GPU work entirely while idle.
+        let any_overlay = self.launcher.open
+            || self.power.open
+            || self.control_open
+            || self.wallpaper.open
+            || self.themes.open
+            || self.switcher.active
+            || self.switcher.anim > 0.001;
+        if self.hidden && !self.y_animating && !any_overlay {
+            return;
+        }
+
         // --- Drawing ---
         let viewport_rect = ctx.screen_rect();
         let pill_rect = egui::Rect::from_center_size(
@@ -1096,8 +1135,8 @@ impl eframe::App for DynamicIslandApp {
             egui::Order::Middle,
             egui::Id::new("island_pill"),
         ));
-        let accent = Config::parse_color(&self.cfg.accent_color);
-        let background = Config::parse_color(&self.cfg.background);
+        let accent = self.cached_accent;
+        let background = self.cached_background;
         let font_id = egui::FontId::new(self.cfg.font_size, egui::FontFamily::Proportional);
 
         if !morphing {
@@ -1125,9 +1164,11 @@ impl eframe::App for DynamicIslandApp {
                     IslandMode::Clock => {
                         // Continuous hover transition — everything is drawn here
                         // with the eased hover progress so it stays smooth.
-                        let media_owned = win::media_text().and_then(|m| {
-                            self.media_tex.clone().map(|tex| (tex, m.title, m.artist))
-                        });
+                        let media_owned = if !self.cached_media_title.is_empty() {
+                            self.media_tex.clone().map(|tex| (tex, self.cached_media_title.clone(), self.cached_media_artist.clone()))
+                        } else {
+                            None
+                        };
                         let media_ref = media_owned
                             .as_ref()
                             .map(|(tex, title, artist)| (tex, title.as_str(), artist.as_str()));
@@ -1186,8 +1227,7 @@ impl eframe::App for DynamicIslandApp {
                                 (img, n.body.clone())
                             }
                         } else {
-                            let m = win::media_text().map(|m| (m.title, m.artist)).unwrap_or_default();
-                            ("Now Playing".to_string(), m.0)
+                            ("Now Playing".to_string(), self.cached_media_title.clone())
                         };
                         modes::draw_notification_mode(
                             &painter,
@@ -1213,7 +1253,7 @@ impl eframe::App for DynamicIslandApp {
             }
         } else {
             // The pill morphs into the launcher panel; the clock's slot becomes the search field.
-            let panel_fill = Config::parse_color(&self.cfg.launcher_background);
+            let panel_fill = self.cached_launcher_background;
             let corner = egui::CornerRadius::same(morph_corner.round() as u8);
 
             let shadow_color = lerp_color(
@@ -1270,8 +1310,7 @@ impl eframe::App for DynamicIslandApp {
                                 (img, n.body.clone())
                             }
                         } else {
-                            let m = win::media_text().map(|m| (m.title, m.artist)).unwrap_or_default();
-                            ("Now Playing".to_string(), m.0)
+                            ("Now Playing".to_string(), self.cached_media_title.clone())
                         };
                         modes::draw_notification_mode(
                             &painter,
@@ -1299,8 +1338,8 @@ impl eframe::App for DynamicIslandApp {
             // Launcher content fades in over the last two thirds.
             let content_alpha = ((t - 0.3) / 0.7).clamp(0.0, 1.0);
             if content_alpha > 0.01 {
-                let highlight = Config::parse_color(&self.cfg.launcher_highlight);
-                let launcher_bg = Config::parse_color(&self.cfg.launcher_background);
+                let highlight = self.cached_launcher_highlight;
+                let launcher_bg = self.cached_launcher_background;
                 self.launcher.show(
                     ctx,
                     morph_rect.min,
@@ -1340,7 +1379,7 @@ impl eframe::App for DynamicIslandApp {
             );
             // Grow out of the clock pill for a smooth transition.
             let panel = lerp_rect(pill_rect, target, pe);
-            let highlight = Config::parse_color(&self.cfg.launcher_highlight);
+            let highlight = self.cached_launcher_highlight;
             if let Some(icons) = &self.power_icons {
                 egui::Area::new(egui::Id::new("power_menu"))
                     .order(egui::Order::Foreground)
@@ -1374,10 +1413,12 @@ impl eframe::App for DynamicIslandApp {
             );
             // Grow out of the clock pill for a smooth transition.
             let panel = lerp_rect(pill_rect, target, ce);
-            let accent = Config::parse_color(&self.cfg.accent_color);
-            let media_owned = win::media_text().and_then(|m| {
-                self.media_tex.clone().map(|tex| (tex, m.title, m.artist))
-            });
+            let accent = self.cached_accent;
+            let media_owned = if !self.cached_media_title.is_empty() {
+                self.media_tex.clone().map(|tex| (tex, self.cached_media_title.clone(), self.cached_media_artist.clone()))
+            } else {
+                None
+            };
             let media_ref = media_owned
                 .as_ref()
                 .map(|(tex, title, artist)| (tex, title.as_str(), artist.as_str()));
@@ -1397,6 +1438,8 @@ impl eframe::App for DynamicIslandApp {
                             icons,
                             media_ref,
                             win::get_volume(),
+                            self.cached_background,
+                            self.cached_status_button_bg,
                         );
                         for action in actions {
                             match action {
@@ -1487,7 +1530,7 @@ impl eframe::App for DynamicIslandApp {
             );
             // Grow out of the clock pill for a smooth transition.
             let panel = lerp_rect(pill_rect, target, we);
-            let accent = Config::parse_color(&self.cfg.accent_color);
+            let accent = self.cached_accent;
             let mut picked: Option<String> = None;
             egui::Area::new(egui::Id::new("wallpaper_panel"))
                 .order(egui::Order::Foreground)
@@ -1523,7 +1566,7 @@ impl eframe::App for DynamicIslandApp {
                 egui::vec2(th_width, th_height),
             );
             let panel = lerp_rect(pill_rect, target, te);
-            let accent = Config::parse_color(&self.cfg.accent_color);
+            let accent = self.cached_accent;
             let mut picked_theme: Option<String> = None;
             egui::Area::new(egui::Id::new("themes_panel"))
                 .order(egui::Order::Foreground)
@@ -1561,7 +1604,7 @@ impl eframe::App for DynamicIslandApp {
                 egui::vec2(pill_rect.width(), pill_rect.height()),
             );
             let sw_rect = lerp_rect(start, target, se);
-            let accent = Config::parse_color(&self.cfg.accent_color);
+            let accent = self.cached_accent;
             let mut double_clicked: Option<usize> = None;
             egui::Area::new(egui::Id::new("app_switcher"))
                 .order(egui::Order::Foreground)
@@ -1592,7 +1635,7 @@ impl eframe::App for DynamicIslandApp {
         // A marquee-scrolling media title needs continuous repaints even after
         // the hover animation settles.
         let hover_expanded = self.hover_anim > 0.05 && self.mode == IslandMode::Clock;
-        let scrolling_title = hover_expanded && win::media_text().map(|m| m.title).is_some();
+        let scrolling_title = hover_expanded && !self.cached_media_title.is_empty();
 
         if self.switcher.active {
             // Alt+Tab switcher needs immediate repaints so Tab-taps / highlight

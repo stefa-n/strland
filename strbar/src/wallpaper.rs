@@ -28,6 +28,8 @@ fn load_image_thumbnail(path: &PathBuf) -> Option<(Vec<u8>, u32, u32)> {
 }
 
 fn load_video_first_frame(path: &PathBuf) -> Option<(Vec<u8>, u32, u32)> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     let path_str = path.to_str()?;
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let tmp = std::env::temp_dir().join(format!("strland_thumb_{stem}.png"));
@@ -36,6 +38,7 @@ fn load_video_first_frame(path: &PathBuf) -> Option<(Vec<u8>, u32, u32)> {
         .args(["-y", "-i", path_str, "-vframes", "1", "-q:v", "2", tmp_str])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -329,14 +332,15 @@ fn corner_mask(
     bg: egui::Color32,
     steps: usize,
 ) {
-    let mut pts = Vec::with_capacity(steps + 2);
-    pts.push(corner);
-    for i in 0..=steps {
+    let mut pts = [egui::Pos2::ZERO; 12];
+    let count = (steps + 2).min(pts.len());
+    pts[0] = corner;
+    for i in 0..=steps.min(count - 2) {
         let t = std::f32::consts::FRAC_PI_2 * (i as f32 / steps as f32);
-        pts.push(corner + egui::vec2(dx * r * t.cos(), dy * r * t.sin()));
+        pts[i + 1] = corner + egui::vec2(dx * r * t.cos(), dy * r * t.sin());
     }
-    pts.push(corner);
+    pts[count - 1] = corner;
     painter.add(egui::epaint::PathShape::convex_polygon(
-        pts, bg, egui::Stroke::NONE,
+        pts[..count].to_vec(), bg, egui::Stroke::NONE,
     ));
 }

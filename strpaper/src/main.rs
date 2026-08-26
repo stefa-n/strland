@@ -153,6 +153,7 @@ fn main() {
         transcode_generation: 0,
         widget_host: None,
         widgets_watcher,
+        composed_buf: Vec::new(),
     };
 
     run_message_loop(&mut app);
@@ -200,6 +201,9 @@ struct App {
     transcode_rx: Option<std::sync::mpsc::Receiver<TranscodeResult>>,
     /// Bumped whenever a new job is spawned; stale results are dropped.
     transcode_generation: u64,
+    /// Reusable buffer for compositing widgets over the wallpaper frame.
+    /// Avoids allocating a new Vec every paint call.
+    composed_buf: Vec<u8>,
 }
 
 /// A finished (or failed) background pre-conversion.
@@ -769,28 +773,41 @@ impl App {
                 }
                 // Composite widgets over the wallpaper frame when the widget
                 // canvas matches the raster dimensions.
-                let mut composited: Option<render::Raster> = None;
                 if let Some(host) = &mut self.widget_host {
                     if let Some((cw, ch)) = host.canvas_dims() {
                         if raster_ref.width == cw && raster_ref.height == ch {
-                            let mut frame = raster_ref.bgra.clone();
-                            host.composite_pending(frame.as_mut_slice());
-                            composited = Some(render::Raster {
-                                width: cw,
-                                height: ch,
-                                bgra: frame,
-                            });
+                            // Reuse the persistent buffer to avoid allocating
+                            // a new Vec every frame.
+                            if self.composed_buf.len() != raster_ref.bgra.len() {
+                                self.composed_buf.resize(raster_ref.bgra.len(), 0);
+                            }
+                            self.composed_buf.copy_from_slice(&raster_ref.bgra);
+                            // Always composite: the wallpaper frame may have
+                            // changed (video/GIF) even when widgets are idle,
+                            // so the widget overlay must be re-applied.
+                            host.composite_pending(&mut self.composed_buf);
+                            host.reset_changed();
+                            render::paint_frame(
+                                hdc,
+                                &self.monitors,
+                                self.origin,
+                                &self.composed_buf,
+                                cw,
+                                ch,
+                            );
+                            let _ = EndPaint(self.hwnd, &ps);
+                            return;
                         }
                     }
                 }
-                match &composited {
-                    Some(frame) => {
-                        render::paint_frame(hdc, &self.monitors, self.origin, frame);
-                    }
-                    None => {
-                        render::paint_frame(hdc, &self.monitors, self.origin, raster_ref);
-                    }
-                }
+                render::paint_frame(
+                    hdc,
+                    &self.monitors,
+                    self.origin,
+                    &raster_ref.bgra,
+                    raster_ref.width,
+                    raster_ref.height,
+                );
             } else {
                 render::paint_clear(hdc, &self.monitors, self.origin);
             }

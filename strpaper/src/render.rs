@@ -217,13 +217,13 @@ fn bitmap_info_for(w: i32, h: i32) -> BITMAPINFO {
     }
 }
 
-/// Draw `raster` into `hdc` for every monitor, using a cover fit. `monitors`
-/// are in virtual-desktop coordinates; `origin` is the wallpaper window origin
-/// that the drawing is offset by.
-pub fn paint_frame(hdc: HDC, monitors: &[Monitor], origin: (i32, i32), raster: &Raster) {
+/// Draw raw BGRA pixels into `hdc` for every monitor, using a cover fit.
+/// `monitors` are in virtual-desktop coordinates; `origin` is the wallpaper
+/// window origin that the drawing is offset by.
+pub fn paint_frame(hdc: HDC, monitors: &[Monitor], origin: (i32, i32), bgra: &[u8], width: usize, height: usize) {
     unsafe {
         let _ = SetStretchBltMode(hdc, COLORONCOLOR);
-        let (sw, sh) = (raster.width as i32, raster.height as i32);
+        let (sw, sh) = (width as i32, height as i32);
         if sw <= 0 || sh <= 0 {
             return;
         }
@@ -240,7 +240,7 @@ pub fn paint_frame(hdc: HDC, monitors: &[Monitor], origin: (i32, i32), raster: &
                     src.1,
                     src.2,
                     src.3,
-                    Some(raster.bgra.as_ptr() as *const _),
+                    Some(bgra.as_ptr() as *const _),
                     &bmi,
                     DIB_RGB_COLORS,
                     SRCCOPY,

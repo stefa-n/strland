@@ -32,6 +32,8 @@ unsafe extern "system" {
     fn SetWindowLongPtrW(hWnd: isize, nIndex: i32, dwNewLong: isize) -> isize;
     fn GetWindowLongPtrW(hWnd: isize, nIndex: i32) -> isize;
     fn SetForegroundWindow(hWnd: isize) -> i32;
+    fn BringWindowToTop(hWnd: isize) -> i32;
+    fn GetWindowThreadProcessId(hWnd: isize, lpdwProcessId: *mut u32) -> u32;
     fn AttachThreadInput(id_attach: u32, id_attach_to: u32, f_attach: i32) -> i32;
     fn GetCurrentThreadId() -> u32;
     fn waveOutGetVolume(hwo: usize, pdw_volume: *mut u32) -> u32;
@@ -184,21 +186,30 @@ pub fn reset_pos_cache() {
 
 #[cfg(target_os = "windows")]
 pub fn get_screen_height() -> i32 {
-    unsafe { GetSystemMetrics(SM_CYSCREEN) }
+    fn cached() -> i32 {
+        static HEIGHT: OnceLock<i32> = OnceLock::new();
+        *HEIGHT.get_or_init(|| unsafe { GetSystemMetrics(SM_CYSCREEN) })
+    }
+    cached()
 }
 
 /// Logical points → physical pixels factor for the given window (1.25 at 125% scaling).
 #[cfg(target_os = "windows")]
 pub fn window_scale(hwnd: isize) -> f32 {
+    use std::collections::hash_map::Entry;
+    use std::sync::Mutex;
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<isize, f32>>> = OnceLock::new();
     if hwnd == 0 {
         return 1.0;
     }
-    let dpi = unsafe { GetDpiForWindow(hwnd) };
-    if dpi == 0 {
-        1.0
-    } else {
-        dpi as f32 / 96.0
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    if let Entry::Vacant(e) = map.entry(hwnd) {
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+        e.insert(scale);
     }
+    map[&hwnd]
 }
 
 // ---------------------------------------------------------------------------
@@ -227,8 +238,8 @@ pub fn foreground_covers_screen() -> bool {
         if GetWindowRect(fg, &mut rect) == 0 {
             return false;
         }
-        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        let screen_w = get_screen_width();
+        let screen_h = get_screen_height();
         // Borderless fullscreen: window edges reach (or exceed) the monitor.
         rect.left <= 0 && rect.top <= 0 && rect.right >= screen_w && rect.bottom >= screen_h
     }
@@ -296,7 +307,24 @@ pub fn configure_window_styles(hwnd: isize, clickthrough: bool, accepts_focus: b
 #[cfg(target_os = "windows")]
 pub fn focus_window(hwnd: isize) {
     unsafe {
+        // The AttachThreadInput trick: temporarily attach to the foreground
+        // thread so that SetForegroundWindow succeeds even when another app
+        // currently owns the foreground lock.
+        let current_thread = GetCurrentThreadId();
+        let fg = GetForegroundWindow();
+        let fg_thread = if fg != 0 {
+            GetWindowThreadProcessId(fg, std::ptr::null_mut())
+        } else {
+            0
+        };
+        if fg_thread != 0 && fg_thread != current_thread {
+            AttachThreadInput(current_thread, fg_thread, 1);
+        }
         SetForegroundWindow(hwnd);
+        BringWindowToTop(hwnd);
+        if fg_thread != 0 && fg_thread != current_thread {
+            AttachThreadInput(current_thread, fg_thread, 0);
+        }
     }
 }
 
@@ -696,7 +724,7 @@ unsafe fn run_loopback_analyzer(smooth: &mut [f32; AUDIO_BANDS]) -> windows::cor
 
             if filled >= FFT_SIZE {
                 // Reassemble the ring buffer in chronological order.
-                let mut ordered = vec![0.0f32; FFT_SIZE];
+                let mut ordered = [0.0f32; FFT_SIZE];
                 ordered[..FFT_SIZE - write_pos].copy_from_slice(&window[write_pos..]);
                 ordered[FFT_SIZE - write_pos..].copy_from_slice(&window[..write_pos]);
 
@@ -720,16 +748,18 @@ fn compute_spectrum(samples: &[f32], bands: &mut [f32; AUDIO_BANDS]) {
         return;
     }
 
+    // Stack-allocated buffers for FFT (avoids per-frame heap allocations).
+    let mut re = [0.0f32; FFT_SIZE];
+    let mut im = [0.0f32; FFT_SIZE];
+    let re = &mut re[..n];
+    let im = &mut im[..n];
+
     // Hann window
-    let mut re: Vec<f32> = samples
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let w = 0.5 * (1.0 - (std::f32::consts::TAU * i as f32 / n as f32).cos());
-            s * w
-        })
-        .collect();
-    let mut im = vec![0.0f32; n];
+    for (i, (s, r)) in samples.iter().zip(re.iter_mut()).enumerate() {
+        let w = 0.5 * (1.0 - (std::f32::consts::TAU * i as f32 / n as f32).cos());
+        *r = s * w;
+    }
+    im.fill(0.0);
 
     // Bit-reversal permutation
     let mut j = 0usize;
@@ -848,8 +878,15 @@ pub fn tick_ms() -> u64 {
 /// a console (the app has no console window in release builds).
 pub fn debug_log(msg: &str) {
     use std::io::Write;
-    let path = std::env::temp_dir().join("strland.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    use std::sync::Mutex;
+    static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+    let guard = LOG_FILE.get_or_init(|| {
+        let path = std::env::temp_dir().join("strland.log");
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok();
+        Mutex::new(f)
+    });
+    let mut lock = guard.lock().unwrap();
+    if let Some(f) = lock.as_mut() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -1343,6 +1380,8 @@ pub const POWER_ACTION_SHUTDOWN: u32 = 4;
 
 #[cfg(target_os = "windows")]
 pub fn perform_power_action(action: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     // Use the OS helper executables — the raw Win32 shutdown/lock APIs can be
     // finicky about permissions (e.g. foreground-lock), so shelling out is more
     // reliable.
@@ -1375,7 +1414,7 @@ pub fn perform_power_action(action: u32) -> bool {
         _ => return false,
     };
 
-    cmd.spawn().is_ok()
+    cmd.creation_flags(CREATE_NO_WINDOW).spawn().is_ok()
 }
 
 // ---------------------------------------------------------------------------
