@@ -1,9 +1,4 @@
 //! System data sources for widgets: audio spectrum, media info, battery.
-//!
-//! Audio: WASAPI loopback capture + FFT → 32-band spectrum (same approach as
-//! strbar's pill visualizer, but with more bands for the bigger widget).
-//! Media: WinRT SMTC (GlobalSystemMediaTransportControlsSessionManager).
-//! Battery: GetSystemPowerStatus for internal + SetupAPI for BT devices.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -522,7 +517,6 @@ pub fn start_gpu_poller() {
 }
 
 /// Current GPU utilisation percentage (0-100), sampled by the background
-/// poller. Returns 0 before the first sample is available.
 pub fn gpu_usage() -> i64 {
     GPU_PERCENT.load(Ordering::Relaxed).min(100) as i64
 }
@@ -544,8 +538,7 @@ unsafe fn gpu_poll_loop() { unsafe {
         return;
     }
 
-    // Wildcard counter: one instance per process/engine. We filter to the 3D
-    // engine type and sum across all processes for a total-utilisation figure.
+    // Wildcard counter: one instance per process/engine. We filter to the 3D engine type and sum
     let mut counter = 0isize;
     if PdhAddEnglishCounterW(
         query,
@@ -559,8 +552,7 @@ unsafe fn gpu_poll_loop() { unsafe {
     }
 
     loop {
-        // Rate counters need two samples; with a persistent query every
-        // collection after the first yields valid deltas.
+        // Rate counters need two samples; with a persistent query every collection after the first yields
         if PdhCollectQueryData(query) != 0 {
             std::thread::sleep(Duration::from_secs(1));
             continue;
@@ -608,9 +600,7 @@ unsafe fn gpu_poll_loop() { unsafe {
             if !name.contains("engtype_3D") {
                 continue;
             }
-            // PDH_FMT_COUNTERVALUE carries the formatted value in a union;
-            // for PDH_FMT_DOUBLE requests the f64 member is the payload and
-            // sits right after the 4-byte status word (aligned to 8).
+            // PDH_FMT_COUNTERVALUE carries the formatted value in a union; for PDH_FMT_DOUBLE requests the f64 member is
             let val = *(std::ptr::addr_of!(item.FmtValue).cast::<u8>()
                 .add(8)
                 .cast::<f64>());

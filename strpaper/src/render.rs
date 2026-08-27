@@ -1,13 +1,4 @@
-//! Wallpaper decoding and painting.
-//!
-//! Supported still/animated formats are fully decoded with the `image` crate.
-//! Every decoded frame is stored as a 32-bit BGRA raster (top-down rows of
-//! bytes in B,G,R,A order) ready to be handed straight to GDI.
-//!
-//! Painting happens by drawing the raster into the wallpaper child window's
-//! device context, once per monitor, using a "cover" fit (crop to fill, keep
-//! aspect ratio, centre crop). Coordinates are relative to the wallpaper
-//! window origin, which is passed as `origin`.
+//! Wallpaper decoding and painting — BGRA rasters and GDI cover fit.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -24,19 +15,17 @@ use windows::Win32::Graphics::Gdi::{
     DIB_USAGE, GET_STOCK_OBJECT_FLAGS, HBRUSH, HDC, ROP_CODE, STRETCH_BLT_MODE,
 };
 
-// GDI constants (kept local to avoid name-resolution churn across versions).
 const DIB_RGB_COLORS: DIB_USAGE = DIB_USAGE(0);
 const SRCCOPY: ROP_CODE = ROP_CODE(0x00CC_0020);
 const COLORONCOLOR: STRETCH_BLT_MODE = STRETCH_BLT_MODE(0x0003);
 const BLACK_BRUSH: GET_STOCK_OBJECT_FLAGS = GET_STOCK_OBJECT_FLAGS(4);
 const BI_RGB: u32 = 0;
 
-/// A decoded, quantised frame in BGRA byte order (top-down rows).
+/// Decoded BGRA frame (top-down).
 #[derive(Clone)]
 pub struct Raster {
     pub width: usize,
     pub height: usize,
-    /// `width * height * 4` bytes arranged B,G,R,A.
     pub bgra: Vec<u8>,
 }
 
@@ -57,36 +46,29 @@ impl Raster {
     }
 }
 
-/// A single frame of an animated wallpaper (e.g. GIF).
 #[derive(Clone)]
 pub struct AnimatedFrame {
     pub raster: Arc<Raster>,
     pub delay: Duration,
 }
 
-/// A decoded animated wallpaper.
 pub struct Animated {
     pub frames: Vec<AnimatedFrame>,
     pub total: Duration,
 }
 
-/// A fully-decoded wallpaper source ready to be painted.
 pub enum Wallpaper {
     Still(Arc<Raster>),
     Animated(Animated),
     Video(crate::video::VideoPlayer),
 }
 
-/// Whether this source has continuous motion that must be re-painted at a
-/// regular cadence.
+/// True if wallpaper needs continuous repaint.
 pub fn needs_ticks(w: &Wallpaper) -> bool {
     matches!(w, Wallpaper::Animated(_) | Wallpaper::Video(_))
 }
 
-/// Select the raster that should be on screen at `elapsed` since playback
-/// started. The returned `Arc` keeps the frame buffer alive while it is being
-/// painted, even if a new frame replaces it concurrently. Returns `None` when
-/// nothing is available to paint.
+/// Frame for elapsed time.
 pub fn frame_at(w: &mut Wallpaper, elapsed: Duration) -> Option<Arc<Raster>> {
     match w {
         Wallpaper::Still(r) => Some(r.clone()),
@@ -95,14 +77,11 @@ pub fn frame_at(w: &mut Wallpaper, elapsed: Duration) -> Option<Arc<Raster>> {
     }
 }
 
-/// Scale a raster to exactly `(tw x th)` using a centre-crop "cover" fit.
-/// `fast` selects nearest-neighbour (GIF frames); otherwise triangle filtering
-/// is used (still images).
+/// Scale raster to cover target size.
 pub fn fit_cover(raster: &Raster, tw: usize, th: usize, fast: bool) -> Raster {
     use image::imageops::FilterType;
     let filter = if fast { FilterType::Nearest } else { FilterType::Triangle };
 
-    // BGRA -> RGBA for the image crate.
     let mut rgba = Vec::with_capacity(raster.bgra.len());
     for px in raster.bgra.chunks_exact(4) {
         rgba.push(px[2]);
@@ -115,7 +94,6 @@ pub fn fit_cover(raster: &Raster, tw: usize, th: usize, fast: bool) -> Raster {
         return raster.clone();
     };
 
-    // Centre-crop to the target aspect ratio, then resize.
     let src_ar = raster.width as f64 / raster.height.max(1) as f64;
     let dst_ar = tw as f64 / th.max(1) as f64;
     let cropped = if src_ar > dst_ar {
@@ -129,7 +107,6 @@ pub fn fit_cover(raster: &Raster, tw: usize, th: usize, fast: bool) -> Raster {
     };
     let resized = image::imageops::resize(&cropped.to_image(), tw as u32, th as u32, filter);
 
-    // RGBA -> BGRA.
     let mut bgra = resized.into_raw();
     for px in bgra.chunks_exact_mut(4) {
         px.swap(0, 2);
@@ -141,14 +118,13 @@ pub fn fit_cover(raster: &Raster, tw: usize, th: usize, fast: bool) -> Raster {
     }
 }
 
-/// Decode a still image file into a raster.
 pub fn decode_still(path: &Path) -> Result<Raster, String> {    let img = image::open(path).map_err(|e| format!("image open failed: {e}"))?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     Ok(Raster::from_rgba(&rgba.into_raw(), w, h))
 }
 
-/// Decode an animated image (GIF) into its frames.
+/// Decode GIF frames.
 pub fn decode_animated(path: &Path) -> Result<Animated, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open failed: {e}"))?;
     let decoder = GifDecoder::new(std::io::BufReader::new(file))
@@ -177,8 +153,6 @@ pub fn decode_animated(path: &Path) -> Result<Animated, String> {
     Ok(Animated { frames, total })
 }
 
-/// Select the GIF frame whose time window contains `elapsed`, looping around
-/// the animation timeline.
 fn gif_frame_at(a: &Animated, elapsed: Duration) -> Option<&Arc<Raster>> {
     if a.frames.is_empty() {
         return None;
@@ -199,7 +173,6 @@ fn gif_frame_at(a: &Animated, elapsed: Duration) -> Option<&Arc<Raster>> {
     a.frames.last().map(|f| &f.raster)
 }
 
-/// Build the GDI bitmap info describing a BGRA raster.
 fn bitmap_info_for(w: i32, h: i32) -> BITMAPINFO {
     let header = BITMAPINFOHEADER {
         biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -217,9 +190,7 @@ fn bitmap_info_for(w: i32, h: i32) -> BITMAPINFO {
     }
 }
 
-/// Draw raw BGRA pixels into `hdc` for every monitor, using a cover fit.
-/// `monitors` are in virtual-desktop coordinates; `origin` is the wallpaper
-/// window origin that the drawing is offset by.
+/// Paint BGRA to monitors with cover fit.
 pub fn paint_frame(hdc: HDC, monitors: &[Monitor], origin: (i32, i32), bgra: &[u8], width: usize, height: usize) {
     unsafe {
         let _ = SetStretchBltMode(hdc, COLORONCOLOR);
@@ -250,8 +221,7 @@ pub fn paint_frame(hdc: HDC, monitors: &[Monitor], origin: (i32, i32), bgra: &[u
     }
 }
 
-/// Overwrite every monitor region with opaque black (used when the wallpaper
-/// is removed).
+/// Clear monitors to black.
 pub fn paint_clear(hdc: HDC, monitors: &[Monitor], origin: (i32, i32)) {
     unsafe {
         let brush = HBRUSH(GetStockObject(BLACK_BRUSH).0);
@@ -267,8 +237,6 @@ pub fn paint_clear(hdc: HDC, monitors: &[Monitor], origin: (i32, i32)) {
     }
 }
 
-/// Compute the destination rectangle for a cover fit of an image of size
-/// `(sw, sh)` into `mon`, together with the source crop rectangle.
 fn cover_rects(sw: i32, sh: i32, mon: Monitor) -> Option<((i32, i32, i32, i32), (i32, i32, i32, i32))> {
     let (mw, mh) = (mon.width, mon.height);
     if sw <= 0 || sh <= 0 || mw <= 0 || mh <= 0 {
@@ -280,17 +248,14 @@ fn cover_rects(sw: i32, sh: i32, mon: Monitor) -> Option<((i32, i32, i32, i32), 
     Some((dst, src))
 }
 
-/// Centre-crop a `(sw, sh)` source so that its aspect ratio matches `(dw, dh)`.
 fn centre_crop(sw: i32, sh: i32, dw: i32, dh: i32) -> (i32, i32, i32, i32) {
     let target_ratio = dw as f64 / dh.max(1) as f64;
     let src_ratio = sw as f64 / sh.max(1) as f64;
     if src_ratio > target_ratio {
-        // Source is wider than target: crop the sides.
         let crop_w = (sh as f64 * target_ratio).round() as i32;
         let crop_w = crop_w.min(sw);
         ((sw - crop_w) / 2, 0, crop_w, sh)
     } else {
-        // Source is taller than target: crop the top and bottom.
         let crop_h = (sw as f64 / target_ratio).round() as i32;
         let crop_h = crop_h.min(sh);
         (0, (sh - crop_h) / 2, sw, crop_h)

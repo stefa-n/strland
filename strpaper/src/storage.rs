@@ -1,72 +1,33 @@
-//! Wallpaper storage and file selection.
-//!
-//! All wallpaper files are stored in a per-user application directory resolved
-//! at runtime from the current Windows account:
-//!
-//! ```text
-//! %USERPROFILE%\.strland\strpaper\
-//! ```
-//!
-//! For example: `C:\Users\<SomeUser>\.strland\strpaper\`
-//!
-//! The path is never hard-coded and never taken from the directory that
-//! contains the `strpaper.exe` executable, so the same binary works for every
-//! Windows account. The directory is created automatically if it does not
-//! exist.
+//! Wallpaper storage — resolves `%USERPROFILE%\.strland\strpaper\` and selects files.
 
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// The fixed filename prefix used for every supported wallpaper.
 pub const WALLPAPER_BASENAME: &str = "wallpaper";
-
-/// Optional configuration file inside the wallpaper directory.
-///
-/// ```toml
-/// # Which file in this directory to show, e.g.:
-/// wallpaper = "sunset.mp4"
-/// ```
-///
-/// Omitting it keeps the default behaviour: the most recently modified
-/// `wallpaper.<ext>` file is shown.
 pub const CONFIG_FILE_NAME: &str = "config.toml";
-
-/// The recognised wallpaper file extensions, in canonical order.
-///
-/// Any `wallpaper.<ext>` file inside the wallpaper directory is a candidate.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "gif", "mp4", "webm"];
-
-/// The name of the wallpaper directory that lives under the user's `.strland`
-/// directory.
 pub const WALLPAPER_DIR_NAME: &str = "strpaper";
 
-/// A wallpaper candidate found on disk.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub path: PathBuf,
     pub modified: std::time::SystemTime,
 }
 
-/// Resolve the wallpaper directory for the current user.
-///
-/// Resolution order:
-/// 1. `%USERPROFILE%` environment variable (current Windows user's home).
-/// 2. `%USERPROFILE%` fall-through to the parent home + `.strland\strpaper`.
-///
-/// The directory is created (recursively) if it does not already exist.
+/// Resolve wallpaper dir, creating it if missing.
 pub fn wallpaper_dir() -> PathBuf {
     let dir = wallpaper_dir_uncreated();
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
 
-/// Resolve the wallpaper directory but do not create it.
+/// Resolve wallpaper dir without creating it.
 pub fn wallpaper_dir_uncreated() -> PathBuf {
     let home = home_dir();
     home.join(".strland").join(WALLPAPER_DIR_NAME)
 }
 
-/// Determine the current user's home directory.
+/// Current user's home directory.
 pub fn home_dir() -> PathBuf {
     if let Ok(p) = env::var("USERPROFILE") {
         if !p.is_empty() {
@@ -80,11 +41,7 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(format!("{drive}{path}"))
 }
 
-/// Scan the wallpaper directory for supported `wallpaper.*` files.
-///
-/// This deliberately only looks for files whose file stem is exactly
-/// `wallpaper` and whose extension is one of [`SUPPORTED_EXTENSIONS`]. No
-/// arbitrary directories are scanned.
+/// Scan for `wallpaper.*` candidates.
 pub fn list_candidates(dir: &Path) -> Vec<Candidate> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -119,15 +76,7 @@ pub fn list_candidates(dir: &Path) -> Vec<Candidate> {
     out
 }
 
-/// Choose the active wallpaper from the list of candidates.
-///
-/// Priority (deterministic, documented in the README):
-/// 1. If more than one candidate exists, prefer the file whose last modified
-///    time is most recent (most recently replaced).
-/// 2. On an exact tie (identical modification time, e.g. from a quick
-///    sequence) fall back to the extension order defined by
-///    [`SUPPORTED_EXTENSIONS`] and finally to a lexicographic sort so the
-///    result is fully deterministic.
+/// Pick active wallpaper: newest mtime, then extension order.
 pub fn choose_primary(candidates: &mut Vec<Candidate>) -> Option<Candidate> {
     if candidates.is_empty() {
         return None;
@@ -141,22 +90,17 @@ pub fn choose_primary(candidates: &mut Vec<Candidate>) -> Option<Candidate> {
     Some(candidates.remove(0))
 }
 
-/// Path of the optional config file inside the wallpaper directory.
 pub fn config_path(dir: &Path) -> PathBuf {
     dir.join(CONFIG_FILE_NAME)
 }
 
-/// Read the configured wallpaper file name (the `wallpaper` key), if any.
-///
-/// Deliberately dependency-free: one `key = "value"` line, `#` comments.
+/// Read `wallpaper` key from config.
 pub fn read_configured_name(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(config_path(dir)).ok()?;
     parse_wallpaper_name(&text)
 }
 
-/// Read the optional `quality` key — the height videos are pre-scaled to
-/// before playback (e.g. `"1080p"`, `"720p"`, `1080`). `None` keeps the
-/// source resolution.
+/// Read `quality` key (target height).
 pub fn read_configured_quality(dir: &Path) -> Option<u32> {
     let text = std::fs::read_to_string(config_path(dir)).ok()?;
     parse_quality(&text)
@@ -199,7 +143,6 @@ fn parse_wallpaper_name(text: &str) -> Option<String> {
             continue;
         }
         let value = value.trim();
-        // Strip one layer of quotes if present.
         let value = value
             .strip_prefix('"')
             .and_then(|v| v.strip_suffix('"'))
@@ -210,14 +153,10 @@ fn parse_wallpaper_name(text: &str) -> Option<String> {
     None
 }
 
-/// Resolve the wallpaper file to display.
-///
-/// With a valid configured name that exists in the directory, that file is
-/// used. Otherwise the default priority rules apply (see [`choose_primary`]).
+/// Resolve wallpaper file, preferring config name.
 pub fn resolve_wallpaper_file(dir: &Path, name: Option<&str>) -> Option<PathBuf> {
     if let Some(name) = name {
         let rel = Path::new(name);
-        // Only bare file names inside the wallpaper dir are allowed.
         if rel.components().count() == 1 {
             let supported = rel
                 .extension()
@@ -233,7 +172,6 @@ pub fn resolve_wallpaper_file(dir: &Path, name: Option<&str>) -> Option<PathBuf>
                 }
             }
         }
-        // Fall through: invalid/missing configuration falls back to defaults.
     }
     let mut candidates = list_candidates(dir);
     choose_primary(&mut candidates).map(|c| c.path)

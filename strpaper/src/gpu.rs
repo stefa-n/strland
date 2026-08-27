@@ -1,11 +1,4 @@
-//! D3D11 video pipeline: hardware decode hand-off and GPU colour conversion.
-//!
-//! `Gpu` owns a hardware D3D11 device. The device is shared with Media
-//! Foundation through `IMFDXGIDeviceManager` (so the H.264 decoder runs on the
-//! GPU's video engine instead of the CPU), and its fixed-function video
-//! processor converts decoded NV12 surfaces to BGRA on the GPU. The UI thread
-//! then performs one small copy per frame instead of software-decoding and
-//! converting millions of pixels.
+//! D3D11 hardware decode and NV12→BGRA conversion.
 
 use std::cell::RefCell;
 
@@ -35,7 +28,6 @@ use windows::Win32::Media::MediaFoundation::{
     IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFSample, MF_SOURCE_READER_D3D_MANAGER,
 };
 
-/// Hardware device + Media Foundation interop for one decode session.
 pub struct Gpu {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -43,8 +35,6 @@ pub struct Gpu {
     video_context: ID3D11VideoContext,
     video_context1: Option<ID3D11VideoContext1>,
     manager: IMFDXGIDeviceManager,
-    /// Conversion pipeline for one (src, dst) size; only the decode thread
-    /// touches this, hence RefCell rather than a lock.
     pipeline: RefCell<Option<Pipeline>>,
 }
 
@@ -58,11 +48,7 @@ struct Pipeline {
 }
 
 impl Gpu {
-    /// Create a hardware D3D11 device and register it with Media Foundation.
-    ///
-    /// Enumerates DXGI adapters to prefer the discrete GPU (NVIDIA / AMD)
-    /// instead of the default adapter, which on hybrid laptops is often the
-    /// weak integrated GPU.
+    /// Create D3D11 device, preferring discrete GPU.
     pub fn new() -> Result<Gpu, String> {
         unsafe {
             use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIAdapter};
@@ -71,7 +57,6 @@ impl Gpu {
                 CreateDXGIFactory1().map_err(|e| format!("CreateDXGIFactory1 failed: {e}"))?;
 
             // Prefer the first adapter whose description contains "NVIDIA" or
-            // "AMD" (discrete GPU).  Fall back to the first hardware adapter.
             let mut best: Option<IDXGIAdapter> = None;
             let mut fallback: Option<IDXGIAdapter> = None;
             for i in 0.. {
@@ -99,7 +84,6 @@ impl Gpu {
             let adapter = best.or(fallback)
                 .ok_or("no DXGI hardware adapter found")?;
 
-            // Log the selected adapter so the user can verify the right GPU.
             if let Ok(d) = adapter.GetDesc() {
                 let name = String::from_utf16_lossy(
                     &d.Description[..d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len())]
@@ -156,23 +140,19 @@ impl Gpu {
         }
     }
 
-    /// Attach this device to source-reader attributes so decoding happens on
-    /// the GPU's video engine.
+    /// Attach to source reader for HW decode.
     pub fn attach_to(&self, attrs: &IMFAttributes) -> Result<(), String> {
         unsafe { attrs.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &self.manager) }
             .map_err(|e| format!("set D3D manager failed: {e}"))
     }
 
-    /// Convert one decoded NV12 sample surface into tightly packed BGRA bytes
-    /// at `(out_w x out_h)`, entirely on the GPU.
+    /// Convert NV12 sample to BGRA on GPU.
     pub fn nv12_sample_to_bgra(
         &self,
         sample: &IMFSample,
         out_w: usize,
         out_h: usize,
     ) -> Result<Vec<u8>, String> {
-        // The decoded surface lives in the sample's DXGI buffer; pull the
-        // D3D11 texture (and which array slice holds it) out of that buffer.
         let buffer = unsafe { sample.GetBufferByIndex(0).map_err(|e| format!("no buffer: {e}"))? };
         let dxgi_buffer = buffer
             .cast::<IMFDXGIBuffer>()
@@ -243,7 +223,6 @@ impl Gpu {
                 0,
                 std::slice::from_ref(&stream),
             );
-            // Release the view reference we lent to the stream description.
             std::mem::ManuallyDrop::drop(&mut stream.pInputSurface);
             blt.map_err(|e| format!("VideoProcessorBlt failed: {e}"))?;
 

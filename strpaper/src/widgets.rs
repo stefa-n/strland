@@ -1,25 +1,4 @@
-//! Programmable desktop widgets.
-//!
-//! Every `.rhai` file in `%USERPROFILE%\.strland\strpaper\widgets\` contributes a
-//! `draw(pen)` function. All scripts draw into one shared desktop-sized
-//! canvas; damaged regions are detected, alpha-composited over the wallpaper
-//! frame, and only repainted when something visibly changed. Widgets live
-//! *inside* the wallpaper window: above the wallpaper, below icons/apps.
-//!
-//! ```rhai
-//! fn draw(pen) {
-//!     pen.clear();
-//!     pen.text(24, 24, "Hello!", 28, "#FFFFFF");
-//! }
-//!
-//! // Optional: pick the update rate for this widget (1-120, default 30).
-//! fn fps() { 5 }
-//! ```
-//!
-//! Pen API: `clear`, `fill_rect(x,y,w,h,color)`, `line(x1,y1,x2,y2,w,color)`,
-//! `text(x,y,str,size,color)`, `width`, `height`, `cpu`, `ram`, `time(fmt)`.
-//! Colours are `"#RGB"`, `"#RRGGBB"` or `"#RRGGBBAA"`; alpha blends over the
-//! wallpaper.
+//! Programmable widgets — `.rhai` scripts draw via `Pen` onto wallpaper.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,27 +7,17 @@ use std::time::{Duration, Instant};
 
 use rhai::{Engine, Scope};
 
-/// Fixed virtual canvas that all widget scripts draw into.  Every script
-/// sees `width() = VIRTUAL_W` and `height() = VIRTUAL_H` regardless of
-/// the actual monitor resolution.  The pen scales coordinates to the
-/// physical buffer automatically.
 const VIRTUAL_W: usize = 2880;
 const VIRTUAL_H: usize = 1620;
-
-/// Default frames per second a widget re-runs its script at. Scripts can
-/// override this per widget with an optional `fn fps()` (clamped 1-120).
 const WIDGET_FPS: u64 = 30;
-
 pub const WIDGETS_DIR_NAME: &str = "widgets";
 
-/// Full path of the widgets directory (created if missing).
 pub fn widgets_dir(wallpaper_dir: &std::path::Path) -> std::path::PathBuf {
     let dir = wallpaper_dir.join(WIDGETS_DIR_NAME);
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
 
-/// Write an example widget so the feature is discoverable.
 pub fn ensure_sample(dir: &std::path::Path) {
     let sample = dir.join("clock.rhai");
     let empty = std::fs::read_dir(dir)
@@ -103,8 +72,6 @@ struct PenSurface {
     /// Global opacity applied when the frame is captured (0.0–1.0).
     opacity: f32,
     /// DPI scale factor (e.g. 1.5 for 150%). Coordinates from scripts are
-    /// multiplied by this before touching pixels, so scripts use logical
-    /// coordinates and everything renders at physical resolution.
     scale: f64,
     /// Persistent key-value store that survives across `call_fn` invocations.
     state: HashMap<String, rhai::Dynamic>,
@@ -134,7 +101,6 @@ impl Pen {
     }
 
     /// Logical `(w, h)` — what scripts see.
-    /// Always returns the fixed virtual canvas size.
     pub fn dims(&self) -> (usize, usize) {
         (VIRTUAL_W, VIRTUAL_H)
     }
@@ -148,7 +114,6 @@ impl Pen {
     }
 
     /// Read a value from persistent key-value state (survives across `call_fn` calls).
-    /// Returns `0` if the key has not been set.
     fn state(&self, key: &str) -> rhai::Dynamic {
         let s = self.inner.lock().unwrap();
         s.state.get(key).cloned().unwrap_or(rhai::Dynamic::from(0_i64))
@@ -174,7 +139,6 @@ impl Pen {
     }
 
     /// Snapshot the canvas bytes and clear damage tracking. Returns
-    /// `(x0, y0, x1, y1, bytes)` or `None` when nothing was drawn.
     fn take_frame(&mut self) -> Option<(usize, usize, usize, usize, Vec<u8>)> {
         let mut s = self.inner.lock().unwrap();
         let (x0, y0, x1, y1) = s.bbox?;
@@ -204,8 +168,6 @@ impl Pen {
     }
 
     /// Read the current pixel data at a given region without modifying any
-    /// state (unlike `take_frame` which resets `bbox`). Used by the host to
-    /// re-composite non-due widgets when any widget changes.
     fn peek_frame(&self, bx0: usize, by0: usize, bx1: usize, by1: usize) -> Option<Vec<u8>> {
         let s = self.inner.lock().unwrap();
         if s.pixels.is_empty() || bx1 <= bx0 || by1 <= by0 {
@@ -296,7 +258,6 @@ impl Pen {
 // Script-facing methods.
 impl Pen {
     /// Draw an arc (partial circle outline) centred at (cx, cy).
-    /// `start_deg` and `sweep_deg` are in degrees; 0° = right, 90° = down.
     pub fn arc(&mut self, cx: i64, cy: i64, r: i64, start_deg: f64, sweep_deg: f64, thickness: i64, c: [u8; 4]) {
         let steps = ((sweep_deg.abs() as i64).max(4) * 2) as usize;
         let half = (thickness.max(1) / 2) as i64;
@@ -309,12 +270,10 @@ impl Pen {
         }
     }
 
-    /// Draw a circle outline.
     pub fn circle(&mut self, cx: i64, cy: i64, r: i64, thickness: i64, c: [u8; 4]) {
         self.arc(cx, cy, r, 0.0, 360.0, thickness, c);
     }
 
-    /// Draw a filled circle.
     pub fn fill_circle(&mut self, cx: i64, cy: i64, r: i64, c: [u8; 4]) {
         let sc = { self.inner.lock().unwrap().scale };
         let scx = (cx as f64 * sc) as i64;
@@ -340,12 +299,9 @@ impl Pen {
         let (sc, lw, lh) = { let s = self.inner.lock().unwrap(); (s.scale, s.w, s.h) };
         let pw = (lw as f64 * sc).ceil() as i64;
         let ph = (lh as f64 * sc).ceil() as i64;
-        // Main body
         self.fill_solid(x, y + radius, w, h - radius * 2, c);
-        // Top and bottom strips
         self.fill_solid(x + radius, y, w - radius * 2, radius, c);
         self.fill_solid(x + radius, y + h - radius, w - radius * 2, radius, c);
-        // Corner arcs with anti-aliased edges.
         let rf = radius as f64;
         let mut corners: Vec<(i64, i64, u8)> = Vec::new();
         for dy in -radius..=radius {
@@ -421,7 +377,6 @@ impl Pen {
     }
 
     /// Set global opacity (0.0–1.0) applied to every pixel when the frame is
-    /// captured. Call at the top of `draw()` before any drawing.
     pub fn set_opacity(&self, a: f32) {
         self.inner.lock().unwrap().opacity = a.clamp(0.0, 1.0);
     }
@@ -533,7 +488,6 @@ impl Pen {
     }
 
     /// Formatted local date. Without an argument this yields the short
-    /// weekday/month form, e.g. `Mon, Aug 24`.
     fn date(&mut self, fmt: &str) -> String {
         unsafe {
             use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -567,7 +521,6 @@ impl Pen {
     }
 
     /// Load an image from disk (or wallpaper-relative path), resize to
-    /// `(w x h)` and alpha-blend onto the canvas at `(x, y)`.
     fn draw_image_impl(&mut self, x: i64, y: i64, w: i64, h: i64, path: &str) {
         let sc = { self.inner.lock().unwrap().scale };
         let pw = (w as f64 * sc).ceil() as usize;
@@ -600,8 +553,6 @@ impl Pen {
     }
 
     /// Draw the current frame of a video file at `(x, y)` scaled to
-    /// `(w x h)`. The file is decoded continuously on a background thread
-    /// (one player per path), so this always shows live playback.
     fn draw_video_impl(&mut self, x: i64, y: i64, w: i64, h: i64, path: &str) {
         if w <= 0 || h <= 0 {
             return;
@@ -678,7 +629,6 @@ impl Pen {
     }
 
     /// Write `content` to a file. Creates parent directories if needed.
-    /// Returns true on success.
     fn write_file(path: &str, content: &str) -> bool {
         let resolved = resolve_widget_path(path);
         if let Some(parent) = resolved.parent() {
@@ -705,20 +655,16 @@ struct ScriptItem {
     interval: Duration,
     last_run: Instant,
     /// This widget's own drawing surface (kept between frames so its last
-    /// output stays visible while the script idles).
     pen: Pen,
     /// Hash of this widget's most recent output.
     hash: u64,
     /// True right after this widget produced pixels different from before.
     dirty: bool,
     /// Last accumulated bounding box in the combined buffer, so we can erase
-    /// it before re-accumulating (prevents alpha buildup for semi-transparent
-    /// widgets).
     last_bbox: Option<(usize, usize, usize, usize)>,
 }
 
 /// Runs widget scripts into per-widget canvases and accumulates their output
-/// into one desktop-sized buffer that is composited over the wallpaper.
 pub struct WidgetHost {
     width: usize,
     height: usize,
@@ -726,7 +672,6 @@ pub struct WidgetHost {
     buf: Vec<u8>,
     items: Vec<ScriptItem>,
     /// Set when any widget produced pixels that differ from its previous
-    /// output (used to skip redundant repaints).
     changed: bool,
 }
 
@@ -756,16 +701,6 @@ impl WidgetHost {
     }
 
     /// Run each script when its own throttle interval elapses (scripts can
-    /// pick their rate with an optional `fn fps()`; default [`WIDGET_FPS`]).
-    ///
-    /// Every script owns a private surface, so a widget's drawing stays on
-    /// screen unchanged while it idles — only the widgets whose code actually
-    /// re-runs produce new pixels.
-    ///
-    /// When any widget changes, the dirty region (union of all changed widgets'
-    /// old + new bounding boxes) is cleared **once**, then **all** widgets are
-    /// re-composited into it. This prevents one widget's `clear_buf_region`
-    /// call from erasing another widget's freshly accumulated pixels.
     pub fn render_tick(&mut self) {
         if self.items.is_empty() {
             return;
@@ -844,7 +779,6 @@ impl WidgetHost {
 
         // --- Pass 4: re-accumulate ALL widgets into the dirty region ----------
         for i in 0..self.items.len() {
-            // Prefer the freshly rendered frame if available; otherwise peek.
             if let Some((x0, y0, x1, y1, bytes)) = &new_frames[i] {
                 self.accumulate(*x0, *y0, *x1, *y1, bytes);
                 let item = &mut self.items[i];
@@ -853,8 +787,7 @@ impl WidgetHost {
                 item.last_bbox = Some((*x0, *y0, *x1, *y1));
                 self.changed = true;
             } else if let Some((bx0, by0, bx1, by1)) = self.items[i].last_bbox {
-                // Non-due widget with existing output — only re-composite
-                // if its bbox touches the dirty region.
+                // Non-due widget with existing output — only re-composite if its bbox touches the dirty region.
                 if bx0 < dirty.2 && bx1 > dirty.0 && by0 < dirty.3 && by1 > dirty.1 {
                     if let Some(bytes) = self.items[i].pen.peek_frame(bx0, by0, bx1, by1) {
                         self.accumulate(bx0, by0, bx1, by1, &bytes);
@@ -866,7 +799,6 @@ impl WidgetHost {
     }
 
     /// True when the combined buffer holds no pixels in the given region
-    /// (i.e. this is the widget's very first output there).
     fn buf_is_blank_at(&self, x0: usize, y0: usize, x1: usize, y1: usize) -> bool {
         for dy in y0..y1.min(self.height) {
             for dx in x0..x1.min(self.width) {
@@ -880,7 +812,6 @@ impl WidgetHost {
     }
 
     /// Zero out a rectangular region in the combined buffer so a widget can
-    /// re-accumulate without alpha buildup.
     fn clear_buf_region(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
         let cw = self.width;
         for dy in y0..y1.min(self.height) {
@@ -915,8 +846,7 @@ impl WidgetHost {
                     continue;
                 }
                 let a = bytes[s0 + 3] as u32;
-                // src-over onto the accumulating buffer (which starts fully
-                // transparent, so opaque sources simply replace).
+                // src-over onto the accumulating buffer (which starts fully transparent, so opaque sources simply replace).
                 let inv = 255 - a;
                 self.buf[d] =
                     (bytes[s0] as u32 + self.buf[d] as u32 * inv / 255).min(255) as u8;
@@ -931,7 +861,6 @@ impl WidgetHost {
     }
 
     /// Alpha-composite the accumulated widget output onto `dst` (the wallpaper
-    /// frame, BGRA, same dimensions).
     pub fn composite_pending(&mut self, dst: &mut [u8]) {
         let n = dst.len().min(self.buf.len());
         for d in (0..n).step_by(4) {
@@ -972,11 +901,7 @@ impl WidgetHost {
         ensure_sample(&dir);
 
         let (cw, ch) = (size.0.max(1) as usize, size.1.max(1) as usize);
-        // `size` is already in physical monitor pixels (the process is
-        // per-monitor DPI aware), so do NOT multiply by dpi_scale here —
-        // an oversized canvas would be downscaled at blit time, destroying
-        // anti-aliasing. Script-facing DPI handling happens exclusively via
-        // `pen_scale`, which normalizes the virtual canvas to this buffer.
+        // `size` is already in physical monitor pixels (the process is per-monitor DPI aware), so do
         let pw = cw;
         let ph = ch;
         let mut host = WidgetHost {
@@ -987,8 +912,6 @@ impl WidgetHost {
             changed: false,
         };
 
-        // Scale from the virtual canvas (VIRTUAL_W×VIRTUAL_H) to the
-        // physical pixel buffer (pw×ph).  On 16:9 monitors the ratio is
         // identical for both axes so a single scale factor works.
         let pen_scale = pw as f64 / VIRTUAL_W as f64;
 
@@ -1281,7 +1204,6 @@ fn dynamic_to_serde(val: &rhai::Dynamic) -> Result<serde_json::Value, ()> {
 // ---------------------------------------------------------------------------
 
 /// Cache of loaded custom fonts: maps canonical path → (family name, resource ID).
-/// Fonts are loaded with FR_PRIVATE so they auto-remove on process exit.
 fn font_cache() -> &'static Mutex<HashMap<std::path::PathBuf, (String, i32)>> {
     static CACHE: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, (String, i32)>>> =
         std::sync::OnceLock::new();
@@ -1289,7 +1211,6 @@ fn font_cache() -> &'static Mutex<HashMap<std::path::PathBuf, (String, i32)>> {
 }
 
 /// Resolve a font parameter: if it looks like a file path, load the TTF and
-/// return its family name; otherwise return the string as-is.
 fn resolve_font(font: &str) -> String {
     let p = std::path::Path::new(font);
     if !p.is_absolute() && !p.exists() {
@@ -1304,7 +1225,6 @@ fn resolve_font(font: &str) -> String {
             return family.clone();
         }
     }
-    // Parse the family name from the TTF name table
     let family = std::fs::read(&canonical)
         .ok()
         .and_then(|data| {
@@ -1350,7 +1270,6 @@ fn resolve_font(font: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Thread-local scratch DC kept alive across text() calls to avoid
-/// CreateCompatibleDC / DeleteDC churn.
 fn text_mem_dc() -> windows::Win32::Graphics::Gdi::HDC {
     use std::cell::Cell;
     thread_local! {
@@ -1383,7 +1302,6 @@ fn draw_text_buffer(pen: &mut Pen, x: i64, y: i64, text: &str, px_i: i64, c: [u8
     // Supersample factor: render at 4x then downsample for smooth antialiasing.
     const S: usize = 4;
 
-    // Scale logical coordinates to physical pixel space.
     let phys_x = (x as f64 * sc) as i64;
     let phys_y = (y as f64 * sc) as i64;
     let phys_spacing = (spacing as f64 * sc) as i64;
@@ -1544,7 +1462,6 @@ fn image_cache() -> &'static Mutex<ImageCache> {
 type VideoPlayers = HashMap<PathBuf, Arc<crate::video::VideoPlayer>>;
 
 /// One background decoder per video path used by widgets. Players keep
-/// looping their source forever; frames are fetched at draw time.
 fn video_players() -> &'static Mutex<VideoPlayers> {
     static PLAYERS: OnceLock<Mutex<VideoPlayers>> = OnceLock::new();
     PLAYERS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1573,7 +1490,6 @@ fn video_player_for(
 type SvgCache = HashMap<(PathBuf, u32, u32), Arc<Vec<u8>>>;
 
 /// Maximum number of SVG entries kept in the cache. When the limit is hit
-/// the entire cache is cleared (simple and prevents unbounded growth).
 const SVG_CACHE_MAX: usize = 128;
 
 /// Maximum number of decoded image entries kept in the cache.
@@ -1620,7 +1536,6 @@ fn render_svg(data: &[u8], tw: u32, th: u32) -> Option<Vec<u8>> {
     let mut pixmap = tiny_skia::Pixmap::new(tw, th)?;
     pixmap.fill(tiny_skia::Color::TRANSPARENT);
 
-    // Scale from the SVG's intrinsic size to the requested output size.
     let size = tree.size();
     let sx = tw as f32 / size.width().max(1.0);
     let sy = th as f32 / size.height().max(1.0);
@@ -1629,8 +1544,7 @@ fn render_svg(data: &[u8], tw: u32, th: u32) -> Option<Vec<u8>> {
         resvg::render(&tree, tiny_skia::Transform::from_scale(sx, sy), &mut view);
     }
 
-    // tiny-skia stores premultiplied RGBA; convert to straight alpha for the
-    // shared blend helper.
+    // tiny-skia stores premultiplied RGBA; convert to straight alpha for the shared blend helper.
     let raw = pixmap.take();
     let mut out = Vec::with_capacity(raw.len());
     for px in raw.chunks_exact(4) {
@@ -1769,7 +1683,6 @@ fn load_image_cached(resolved: &Path) -> Option<(u32, u32, Arc<Vec<u8>>)> {
 }
 
 /// Blend an RGBA pixel buffer onto the canvas at `(x, y)` with dimensions `(w, h)`.
-/// Coordinates are in logical space; the function scales to physical pixels.
 fn blend_rgba_at(pen: &Pen, x: i64, y: i64, w: usize, h: usize, rgba: &[u8]) {
     let mut s = pen.inner.lock().unwrap();
     let sc = s.scale;
@@ -1811,7 +1724,6 @@ fn blend_rgba_at(pen: &Pen, x: i64, y: i64, w: usize, h: usize, rgba: &[u8]) {
 }
 
 /// Format a `SYSTEMTIME` using `strftime`-style specifiers:
-/// `%H %M %S %Y %m %d %e %p %a %A %b %B`.
 fn format_datetime(st: windows::Win32::Foundation::SYSTEMTIME, fmt: &str) -> String {
     const WEEKDAYS_SHORT: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const WEEKDAYS_LONG: [&str; 7] = [
@@ -1918,8 +1830,7 @@ fn cpu_usage() -> i64 {
 }
 
 fn fnv_hash(bytes: &[u8]) -> u64 {
-    // Sampled FNV-1a: striding keeps large canvases cheap while still
-    // catching any real content change with near-certainty.
+    // Sampled FNV-1a: striding keeps large canvases cheap while still catching any real content change with
     const STRIDE: usize = 97;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;

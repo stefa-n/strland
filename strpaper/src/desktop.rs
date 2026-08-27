@@ -1,13 +1,4 @@
-//! Win32 desktop-integration layer.
-//!
-//! `strpaper` paints its wallpaper into a child window that is reparented into
-//! the desktop's **background** WorkerW — the window behind the desktop icons.
-//! Because the wallpaper is a child of the desktop window, it is always drawn
-//! underneath every application window, and no visible top-level window of our
-//! own is ever created (so there is no taskbar button and no Alt+Tab entry).
-//!
-//! When Explorer is absent (a custom shell) it falls back to the desktop
-//! window itself.
+//! Desktop integration — hosts wallpaper behind icons via WorkerW.
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM, BOOL};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
@@ -22,16 +13,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CYVIRTUALSCREEN, SW_SHOWMAXIMIZED, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
-/// The magic message that makes Explorer create/refresh the desktop WorkerW.
 const WM_SPAWN_WORKERW: u32 = 0x052C;
-
-/// The child window class that carries the desktop icons (`SHELLDLL_DefView`).
 const DEFVIEW_CLASS: &str = "SHELLDLL_DefView";
-
-/// The WorkerW window class.
 const WORKERW_CLASS: &str = "WorkerW";
 
-/// A single display monitor's rectangle in virtual desktop coordinates.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Monitor {
     pub left: i32,
@@ -40,13 +25,10 @@ pub struct Monitor {
     pub height: i32,
 }
 
-/// Find the desktop window that our wallpaper child window should be a child
-/// of. This is the background WorkerW behind the icons when Explorer is
-/// present, otherwise the desktop window.
+/// Find desktop host (WorkerW or desktop window).
 pub fn find_host() -> Option<HWND> {
     unsafe {
         if let Some(progman) = find_window_by_class("Progman") {
-            // Ask Explorer to (re)create a WorkerW behind the icons.
             let _ = SendMessageW(progman, WM_SPAWN_WORKERW, WPARAM(0x0D), LPARAM(0));
             if let Some(worker) = worker_behind_defview() {
                 return Some(worker);
@@ -63,8 +45,7 @@ pub fn find_host() -> Option<HWND> {
     }
 }
 
-/// True when **any** visible application window is maximized or fullscreen —
-/// in which case the desktop is covered and there is nothing to render.
+/// True if any app covers the desktop.
 pub fn any_window_covers_desktop() -> bool {
     let mut found = false;
     unsafe {
@@ -76,8 +57,6 @@ pub fn any_window_covers_desktop() -> bool {
     found
 }
 
-/// Windows that belong to the shell/desktop itself and never count as "an app
-/// covering the screen".
 const SHELL_WINDOW_CLASSES: [&str; 4] =
     ["Progman", "WorkerW", "Shell_TrayWnd", "strpaper.WallpaperWindow"];
 
@@ -88,8 +67,6 @@ unsafe extern "system" fn enum_maximized_proc(hwnd: HWND, lparam: LPARAM) -> BOO
         return true.into();
     }
 
-    // Skip cloaked windows: suspended UWP apps and similar ghosts stay alive
-    // with stale sizes and report themselves as visible, but are not rendered.
     let mut cloaked = 0u32;
     if DwmGetWindowAttribute(
         hwnd,
@@ -103,14 +80,11 @@ unsafe extern "system" fn enum_maximized_proc(hwnd: HWND, lparam: LPARAM) -> BOO
         return true.into();
     }
 
-    // Skip tool windows / screen overlays (widgets, launchers, helpers) —
-    // genuine maximized apps are never tool windows.
     let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     if exstyle & WS_EX_TOOLWINDOW.0 as isize != 0 {
         return true.into();
     }
 
-    // Skip shell / our own windows.
     let mut cls = [0u16; 64];
     let n = GetClassNameW(hwnd, &mut cls);
     let name = String::from_utf16_lossy(&cls[..(n.max(0) as usize).min(cls.len())]);
@@ -118,7 +92,6 @@ unsafe extern "system" fn enum_maximized_proc(hwnd: HWND, lparam: LPARAM) -> BOO
         return true.into();
     }
 
-    // Maximized?
     let mut placement = WINDOWPLACEMENT::default();
     placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
     if GetWindowPlacement(hwnd, &mut placement).is_ok()
@@ -128,7 +101,6 @@ unsafe extern "system" fn enum_maximized_proc(hwnd: HWND, lparam: LPARAM) -> BOO
         return false.into();
     }
 
-    // Fullscreen: window rect covers its entire monitor.
     let mut rect = windows::Win32::Foundation::RECT::default();
     if GetWindowRect(hwnd, &mut rect).is_ok() {
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -147,13 +119,11 @@ unsafe extern "system" fn enum_maximized_proc(hwnd: HWND, lparam: LPARAM) -> BOO
     true.into()
 }}
 
-/// Enumerate the monitors of the virtual desktop.
 pub fn monitors() -> Vec<Monitor> {
     unsafe { monitor_list() }
 }
 
-/// Compute the bounding box of `monitors` as `(min_x, min_y, width, height)`.
-/// This is the coordinate space our wallpaper window is painted into.
+/// Bounding box of monitors.
 pub fn bounds(monitors: &[Monitor]) -> (i32, i32, i32, i32) {
     let mut min_x = i32::MAX;
     let mut min_y = i32::MAX;
@@ -184,8 +154,7 @@ unsafe fn find_window_by_class(class: &str) -> Option<HWND> { unsafe {
     }
 }}
 
-/// Find the WorkerW that sits directly **behind** the desktop icon host. This
-/// is the background surface the wallpaper must be painted onto.
+/// Find WorkerW behind desktop icons.
 unsafe fn worker_behind_defview() -> Option<HWND> { unsafe {
     let mut result: Option<HWND> = None;
     let _ = EnumWindows(
@@ -197,9 +166,7 @@ unsafe fn worker_behind_defview() -> Option<HWND> { unsafe {
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL { unsafe {
     let ptr = lparam.0 as *mut Option<HWND>;
-    // `hwnd` hosts the desktop icons?
     if find_defview_child(hwnd) {
-        // Grab the WorkerW sibling that is right below the icon host.
         let mut wclass: Vec<u16> = WORKERW_CLASS.encode_utf16().chain(std::iter::once(0)).collect();
         if let Ok(worker) = FindWindowExW(
             HWND::default(),
@@ -229,7 +196,6 @@ unsafe fn find_defview_child(hwnd: HWND) -> bool { unsafe {
     }
 }}
 
-/// Build the list of monitors using Windows' virtual-screen coordinate space.
 unsafe fn monitor_list() -> Vec<Monitor> { unsafe {
     let mut monitors: Vec<Monitor> = Vec::new();
     let _ = EnumDisplayMonitors(

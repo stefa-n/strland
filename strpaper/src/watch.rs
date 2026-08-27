@@ -1,8 +1,4 @@
-//! Hot-reload filesystem watcher for the wallpaper directory.
-//!
-//! The watcher watches the wallpaper directory non-recursively. Any relevant
-//! change flips a shared flag; the main loop picks it up on the next timer
-//! tick and reloads the wallpaper.
+//! Hot-reload watcher for the wallpaper directory.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -10,15 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
-/// A watcher over the wallpaper directory that records pending changes.
+/// Watches wallpaper dir and flags changes.
 pub struct WallpaperWatcher {
-    /// The OS watcher handle; keeping it alive keeps the watch active.
     _watcher: RecommendedWatcher,
     dirty: Arc<AtomicBool>,
 }
 
 impl WallpaperWatcher {
-    /// Start watching `dir` (which must already exist).
+    /// Start watching `dir`.
     pub fn new(dir: &Path) -> Result<WallpaperWatcher, String> {
         let dirty = Arc::new(AtomicBool::new(false));
         let d = dirty.clone();
@@ -41,8 +36,7 @@ impl WallpaperWatcher {
         })
     }
 
-    /// Return `true` if a change was detected since the last call, consuming
-    /// the pending flag in the process.
+    /// Returns true if changed since last check.
     pub fn is_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::SeqCst)
     }

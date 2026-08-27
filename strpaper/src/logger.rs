@@ -1,17 +1,6 @@
-//! Minimal file logger.
-//!
-//! `strpaper` runs as a window-subsystem app with no console, so diagnostics
-//! are appended to a log file in the user's `.strland` directory (a sibling of
-//! the watched `strpaper` directory, so writes never re-trigger a reload):
-//!
-//! ```text
-//! %USERPROFILE%\.strland\strpaper.log
-//! ```
+//! Minimal file logger — appends to `%USERPROFILE%\.strland\strpaper.log`.
 
-/// Append a line to the strpaper log.
-///
-/// Diagnostics are a development aid only: release builds compile this to
-/// nothing, so no log file is ever written.
+/// Append to log file (debug only, no-op in release).
 pub fn log(msg: &str) {
     #[cfg(debug_assertions)]
     {

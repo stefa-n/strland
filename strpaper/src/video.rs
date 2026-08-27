@@ -1,10 +1,4 @@
-//! Media Foundation video playback for MP4 / WebM wallpapers.
-//!
-//! Decoding is performed on a dedicated background thread so the UI thread is
-//! never blocked (no frozen wallpaper / busy cursor). Each decoded frame is
-//! published as an [`Arc<Raster>]` that the UI thread blits from. If the
-//! source cannot be decoded, the player reports a `Failed` status and the
-//! caller hides the wallpaper window, keeping the application responsive.
+//! Media Foundation video playback for MP4/WebM — background decoding.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,19 +20,15 @@ use windows::Win32::UI::Shell::SHCreateMemStream;
 
 use crate::render::Raster;
 
-/// Default frame duration used when the media provides no timing.
 const DEFAULT_FRAME_DUR: Duration = Duration::from_millis(33);
-/// Media Foundation presents sample durations in 100ns ticks.
 const TICKS_TO_NANOS: u64 = 100;
-/// Short sleep used to avoid a hot loop between readable samples.
 const THROTTLE: Duration = Duration::from_millis(4);
 
-/// Initialize Media Foundation once for the process.
+/// Init Media Foundation.
 pub fn startup() -> Result<(), String> {
     unsafe { MFStartup(MF_VERSION, 0) }.map_err(|e| format!("MFStartup failed: {e}"))
 }
 
-/// Shut down Media Foundation.
 pub fn shutdown() {
     let _ = unsafe { MFShutdown() };
 }
@@ -54,29 +44,25 @@ struct Shared {
     version: u64,
 }
 
-/// A live video wallpaper player backed by a background decode thread.
+/// Live video player (background thread).
 pub struct VideoPlayer {
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     started: Instant,
     hw: bool,
-    /// Shared pause flag: while set, the decode loop idles (no GPU/CPU work).
     paused: Arc<AtomicBool>,
 }
 
 impl VideoPlayer {
-    /// Decode dimensions of an in-memory media file without starting playback.
+    /// Probe dimensions without playback.
     pub fn probe_size(data: &[u8]) -> Option<(u32, u32)> {
         let _com = ComGuard;
         let (_, _, w, h, _) = unsafe { init_reader(data, None) }.ok()?;
         Some((w, h))
     }
 
-    /// Re-encode an in-memory video into H.264 at `out_w x out_h`, entirely in
-    /// memory: frames come from the normal decode pipeline and go straight
-    /// into a Media Foundation Sink Writer backed by a memory byte stream.
-    /// Blocking — run it on a background thread.
+    /// Transcode in-memory video to H.264 (blocking).
     pub fn transcode(
         data: Arc<Vec<u8>>,
         out_w: u32,
@@ -87,7 +73,6 @@ impl VideoPlayer {
         let mut reader = Reader::new(&data, Some((out_w, out_h)), None)?;
 
         unsafe {
-            // Writable memory stream that receives the encoded file.
             let stream = SHCreateMemStream(None).ok_or("create memory stream failed")?;
             let bytestream = MFCreateMFByteStreamOnStream(&stream)
                 .map_err(|e| format!("create byte stream failed: {e}"))?;
@@ -110,7 +95,6 @@ impl VideoPlayer {
             loop {
                 let step = match reader.next() {
                     Next::Frame(raster) => {
-                        // 100ns ticks, matching Media Foundation timing.
                         let dur100 = (reader.frame_dur.as_nanos() / 100).max(1) as i64;
                         write_bgra_sample(
                             &sink,
@@ -136,7 +120,6 @@ impl VideoPlayer {
 
             sink.Finalize().map_err(|e| format!("finalize failed: {e}"))?;
 
-            // Pull the finished file back out of the memory stream.
             bytestream.Seek(msoBegin, 0, 0).map_err(|e| format!("seek failed: {e}"))?;
             let mut out = Vec::new();
             let mut chunk = vec![0u8; 256 * 1024];
@@ -157,12 +140,7 @@ impl VideoPlayer {
         }
     }
 
-    /// Start decoding an in-memory media file. Returns immediately; frames
-    /// are produced on a background thread. The application is never blocked.
-    ///
-    /// `target` is the output size to decode into (typically the monitor
-    /// resolution) — decoding straight to screen size avoids converting and
-    /// blitting far more pixels than will ever be shown.
+    /// Open video (non-blocking, decodes to `target` size).
     pub fn open(
         data: Arc<Vec<u8>>,
         target: Option<(u32, u32)>,
@@ -198,24 +176,19 @@ impl VideoPlayer {
         })
     }
 
-    /// Pause/resume decoding (used when the wallpaper is fully covered).
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
     }
 
-    /// Return the most recently decoded frame (if any).
     pub fn frame_at(&self, _elapsed: Duration) -> Option<Arc<Raster>> {
         let g = self.shared.lock().ok()?;
         Some(g.current.clone())
     }
 
-    /// Monotonic counter bumped every time a new frame is published, so the UI
-    /// can skip repainting when the decoder hasn't produced anything new.
     pub fn version(&self) -> u64 {
         self.shared.lock().map(|g| g.version).unwrap_or(0)
     }
 
-    /// True if the media source could not be decoded.
     pub fn is_failed(&self) -> bool {
         if let Ok(g) = self.shared.lock() {
             matches!(&g.status, Status::Failed(_))
@@ -224,12 +197,10 @@ impl VideoPlayer {
         }
     }
 
-    /// True when this player was opened with GPU decoding.
     pub fn is_hw(&self) -> bool {
         self.hw
     }
 
-    /// The reason the media could not be decoded, if applicable.
     pub fn failure_reason(&self) -> Option<String> {
         if let Ok(g) = self.shared.lock() {
             match &g.status {
@@ -241,7 +212,6 @@ impl VideoPlayer {
         }
     }
 
-    /// True once at least one real (non-empty) frame has been published.
     pub fn has_yielded(&self) -> bool {
         if let Ok(g) = self.shared.lock() {
             g.current.width > 0
@@ -250,20 +220,14 @@ impl VideoPlayer {
         }
     }
 
-    /// Seconds since the player was opened (used for a stall watchdog).
     pub fn active_secs(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
     }
 
-    /// Signal the decode thread to stop and wait for it to finish.
-    /// Returns after at most `timeout`; the thread is detached if it doesn't
-    /// exit in time (same as the old Drop behaviour).
+    /// Stop thread, waiting up to `timeout`.
     pub fn close(&mut self, timeout: Duration) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
-            // Spin-wait up to `timeout` for the thread to notice `stop` and
-            // exit.  Joining directly would block forever if ReadSample is
-            // stuck, so we park the main thread in small increments instead.
             let deadline = Instant::now() + timeout;
             while !h.is_finished() {
                 if Instant::now() >= deadline {
@@ -271,8 +235,6 @@ impl VideoPlayer {
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            // If the thread finished in time, join it to release resources
-            // cleanly.  If not, we just drop the handle (detach).
             if h.is_finished() {
                 let _ = h.join();
             }
@@ -284,8 +246,6 @@ impl Drop for VideoPlayer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
-            // Try to join cleanly within a short timeout so COM resources are
-            // released before the process exits or a new player starts.
             let deadline = Instant::now() + Duration::from_secs(2);
             while !h.is_finished() {
                 if Instant::now() >= deadline {
@@ -296,8 +256,6 @@ impl Drop for VideoPlayer {
             if h.is_finished() {
                 let _ = h.join();
             }
-            // If the thread didn't finish in time it is detached — the OS
-            // reclaims it at process exit.
         }
     }
 }
@@ -343,8 +301,6 @@ fn run_loop(
     };
 
     while !stop.load(Ordering::SeqCst) {
-        // Fully covered by a maximized/fullscreen app: idle the decoder
-        // instead of burning GPU/CPU on frames nobody can see.
         if paused.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(50));
             continue;
@@ -386,9 +342,6 @@ fn run_loop(
         }
     }
 
-    // Release COM objects *before* uninitialising COM.  Dropping
-    // IMFSourceReader / D3D11 resources after CoUninitialize causes
-    // access-violations when switching wallpapers.
     drop(reader);
     drop(gpu);
     drop(data);
@@ -402,7 +355,6 @@ enum Next {
     Error(String),
 }
 
-/// A single open source reader wrapped with our decoding helpers.
 struct Reader {
     source: IMFSourceReader,
     stream_index: u32,
@@ -410,13 +362,10 @@ struct Reader {
     height: u32,
     frame_dur: Duration,
     fmt: PixelFormat,
-    /// Output size to convert into (monitor resolution), if provided.
     target: Option<(u32, u32)>,
-    /// GPU pipeline for hardware decode; `None` = software decode.
     gpu: Option<Arc<crate::gpu::Gpu>>,
 }
 
-/// The uncompressed pixel format the Source Reader delivers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PixelFormat {
     Rgb24,
@@ -444,7 +393,6 @@ impl Reader {
         })
     }
 
-    /// Read and decode the next video sample.
     fn next(&mut self) -> Next {
         unsafe {
             let mut _actual = 0u32;
@@ -498,23 +446,15 @@ impl Reader {
     }
 }
 
-/// Open a source reader for `path`, select its first video stream and request a
-/// **decoded** output format. With a GPU attached the reader is given a DXGI
-/// device manager so the decoder runs on the video engine; otherwise the CPU
-/// decoder is used and NV12/YUY2 is converted to BGRA in software.
-/// Open a source reader over an **in-memory** copy of the media file. The
-/// whole file lives in RAM, so looping playback never touches the disk.
+/// Open source reader over in-memory bytes.
 unsafe fn init_reader(
     data: &[u8],
     gpu: Option<&crate::gpu::Gpu>,
 ) -> Result<(IMFSourceReader, u32, u32, u32, PixelFormat), String> { unsafe {
-    // Wrap the bytes in an IStream and hand that to Media Foundation.
     let stream = SHCreateMemStream(Some(data)).ok_or("create memory stream failed")?;
     let bytestream = MFCreateMFByteStreamOnStream(&stream)
         .map_err(|e| format!("create byte stream failed: {e}"))?;
 
-    // With a GPU present, attach the DXGI device manager so the H.264 decoder
-    // runs on the video engine (hardware) instead of the CPU.
     let mut attrs: Option<windows::Win32::Media::MediaFoundation::IMFAttributes> = None;
     windows::Win32::Media::MediaFoundation::MFCreateAttributes(&mut attrs, 2)
         .map_err(|e| format!("create attributes failed: {e}"))?;
@@ -526,7 +466,6 @@ unsafe fn init_reader(
     let reader = MFCreateSourceReaderFromByteStream(&bytestream, Some(&attrs))
         .map_err(|e| format!("open media source failed: {e}"))?;
 
-    // Find the first video stream.
     let mut video_index: Option<u32> = None;
     for i in 0..32u32 {
         match reader.GetCurrentMediaType(i) {
@@ -542,30 +481,22 @@ unsafe fn init_reader(
     }
     let video_index = video_index.ok_or_else(|| "no video stream present".to_string())?;
 
-    // Ensure the video stream is selected. (We intentionally do NOT deselect
-    // the others; doing so can leave the media source in a bad state.)
     reader
         .SetStreamSelection(video_index, true)
         .map_err(|e| format!("select video stream failed: {e}"))?;
 
-    // Frame size from the (compressed) native type, used to build a complete
-    // output type so the decoder is actually inserted.
     let native = reader
         .GetNativeMediaType(video_index, 0)
         .map_err(|e| format!("read native media type failed: {e}"))?;
     let packed_size = native
         .GetUINT64(&MF_MT_FRAME_SIZE)
         .map_err(|e| format!("read frame size failed: {e}"))?;
-    // MF_MT_FRAME_SIZE packs HEIGHT in the low DWORD and WIDTH in the high
-    // DWORD — getting this backwards yields a sheared/"combined frames" image.
     let width = (packed_size >> 32) as u32;
     let height = (packed_size & 0xFFFF_FFFF) as u32;
     if width == 0 || height == 0 {
         return Err("failed to determine video dimensions".into());
     }
 
-    // Try decoded output formats in preference order (all producible without a
-    // colour-conversion MFT). The first accepted one is used.
     let candidates: [(GUID, PixelFormat); 3] = [
         (MFVideoFormat_NV12, PixelFormat::Nv12),
         (MFVideoFormat_YUY2, PixelFormat::Yuy2),
@@ -588,16 +519,6 @@ unsafe fn build_output_type(packed_size: u64, subtype: GUID) -> Result<IMFMediaT
     Ok(output)
 }}
 
-/// Convert a decoded media sample into a top-down BGRA raster.
-///
-/// With a GPU attached the decoded NV12 surface never touches CPU memory until
-/// after the video processor has converted it to BGRA on the GPU — only the
-/// finished frame is copied back. Without one, the sample's packed surface is
-/// converted in software.
-///
-/// When `target` differs from the source size, frames are converted straight
-/// into that size (nearest sampling) so we never convert or blit more pixels
-/// than the screen can show.
 unsafe fn decode_sample(
     sample: &IMFSample,
     width: u32,
@@ -608,14 +529,11 @@ unsafe fn decode_sample(
 ) -> Result<Raster, String> { unsafe {
     let (w, h) = (width as usize, height as usize);
 
-    // Output size: the requested monitor size, clamped to the source (never
-    // upscale — it wastes CPU and adds nothing for a wallpaper).
     let (out_w, out_h) = match target {
         Some((tw, th)) if tw > 0 && th > 0 => ((tw as usize).min(w), (th as usize).min(h)),
         _ => (w, h),
     };
 
-    // GPU path: hardware decode + video-processor colour conversion.
     if let Some(gpu) = gpu {
         if fmt == PixelFormat::Nv12 {
             let bgra = gpu
@@ -627,7 +545,6 @@ unsafe fn decode_sample(
                 bgra,
             });
         }
-        // Non-NV12 with GPU present: fall through to software conversion.
     }
 
     if sample.GetBufferCount().unwrap_or(0) == 0 {
@@ -648,7 +565,6 @@ unsafe fn decode_sample(
     let dst_row = out_w * 4;
     let mut dst = vec![0u8; dst_row * out_h];
 
-    // Nearest-neighbour source lookup tables, computed once per frame.
     let xs: Vec<usize> = (0..out_w).map(|x| x * w / out_w).collect();
     let ys: Vec<usize> = (0..out_h).map(|y| y * h / out_h).collect();
 
@@ -665,7 +581,6 @@ unsafe fn decode_sample(
     })
 }}
 
-/// NV12 (4:2:0 — Y plane then interleaved UV plane), packed to width.
 fn nv12_to_bgra(
     bytes: &[u8],
     w: usize,
@@ -694,7 +609,6 @@ fn nv12_to_bgra(
     }
 }
 
-/// YUY2 (4:2:2), one macro-pixel is 4 bytes for 2 pixels.
 fn yuy2_to_bgra(
     bytes: &[u8],
     w: usize,
@@ -722,7 +636,6 @@ fn yuy2_to_bgra(
     }
 }
 
-/// RGB24 (BGR, 3 bytes/pixel).
 fn rgb24_to_bgra(
     bytes: &[u8],
     w: usize,
@@ -746,7 +659,6 @@ fn rgb24_to_bgra(
     }
 }
 
-/// yuv_to_rgb using BT.601 limited-range coefficients.
 fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     let c = y as i32 - 16;
     let d = u as i32 - 128;
@@ -761,7 +673,6 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     )
 }
 
-/// Initializes COM on the current thread and uninitializes it on drop.
 struct ComGuard;
 
 impl ComGuard {
@@ -782,7 +693,6 @@ impl Drop for ComGuard {
     }
 }
 
-/// H.264 output type for the transcode sink writer.
 unsafe fn transcode_output_type(
     w: u32,
     h: u32,
@@ -791,14 +701,12 @@ unsafe fn transcode_output_type(
     mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok();
     mt.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).ok();
     mt.SetUINT64(&MF_MT_FRAME_SIZE, pack_frame_size(w, h)).ok();
-    // ~0.07 bits per pixel per frame at 30 fps, clamped to sane bounds.
     let bitrate = ((w as u64 * h as u64 * 30 * 7) / 100).clamp(1_000_000, 40_000_000) as u32;
     mt.SetUINT32(&MF_MT_AVG_BITRATE, bitrate).ok();
     mt.SetUINT64(&MF_MT_FRAME_RATE, pack_frame_size(30, 1)).ok();
     Ok(mt)
 }}
 
-/// RGB32 input type matching our decoded rasters.
 unsafe fn transcode_input_type(
     w: u32,
     h: u32,
@@ -814,7 +722,6 @@ fn pack_frame_size(w: u32, h: u32) -> u64 {
     (h as u64) | ((w as u64) << 32)
 }
 
-/// Wrap a packed BGRA frame into an IMFSample and write it to the sink.
 unsafe fn write_bgra_sample(
     sink: &windows::Win32::Media::MediaFoundation::IMFSinkWriter,
     idx: u32,
